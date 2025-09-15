@@ -33,7 +33,31 @@
     <h3>Email context</h3>
     <div id="email-meta-table"></div>
     <div class="table-btns hidden" id="email-btns-inside">
+      <label class="toolbar-left">
+        <input type="checkbox" id="dryRunToggle" />
+        Dry‑run (preview only)
+      </label>
+      <label class="toolbar-item">
+        <input type="checkbox" id="loggingToggle" />
+        Enable logging
+      </label>
       <button id="sendEmailsBtn">Send Emails</button>
+    </div>
+  </div>
+  <!-- Preview modal -->
+  <div id="previewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="previewTitle">Email preview</h3>
+        <button id="closePreviewBtn" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="previewList"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="copyAllBtn">Copy all</button>
+        <button id="closePreviewBtn2">Close</button>
+      </div>
     </div>
   </div>
   <link rel="stylesheet" href="handsontable.full.min.css" />

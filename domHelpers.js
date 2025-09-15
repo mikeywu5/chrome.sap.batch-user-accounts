@@ -65,6 +65,55 @@ export async function typeValue(el, value, delay = 30) {
   el.dispatchEvent(new Event("focusout", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
 }
+
+/**
+ * Robustly set an input's value trying multiple strategies SAP pages often need.
+ * Falls back to typing when direct setters don't stick.
+ * @param {HTMLInputElement|HTMLTextAreaElement} el
+ * @param {string} value
+ * @param {{delay?: number}} [opts]
+ */
+export async function setInputValueRobust(el, value, opts = {}) {
+  if (!el) return;
+  const delay = Number.isFinite(opts.delay) ? opts.delay : 15;
+  el.focus();
+  const old = el.value;
+  try {
+    // Strategy 1: Native value setter on prototype
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && typeof desc.set === "function") {
+      desc.set.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (el.value === value) return true;
+    }
+  } catch (_) {}
+  try {
+    // Strategy 2: setAttribute + input/change events
+    el.setAttribute("value", value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (el.value === value) return true;
+  } catch (_) {}
+  try {
+    // Strategy 3: beforeinput + composition to trigger SAP listeners
+    el.value = "";
+    el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertReplacementText", data: value }));
+    el.dispatchEvent(new CompositionEvent("compositionstart", { data: "" }));
+    for (const ch of value) {
+      el.dispatchEvent(new CompositionEvent("compositionupdate", { data: ch }));
+    }
+    el.value = value;
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    el.dispatchEvent(new CompositionEvent("compositionend", { data: value }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    if (el.value === value) return true;
+  } catch (_) {}
+  // Strategy 4: fallback to simulated typing
+  await typeValue(el, value, delay);
+  return el.value === value;
+}
 /**
  * Dispatch an event of the given type on the root element and all its descendants.
  * @param {Element} root - The root element to start from

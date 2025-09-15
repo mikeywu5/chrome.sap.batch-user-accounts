@@ -40,6 +40,13 @@ var hot = null;
 var metaHot = null;
 // Persist last selection range(s)
 let lastSelectionRanges = null;
+// UI toggles
+let enableLogging = false;
+let enableDryRun = false;
+
+function log(...args) {
+  if (enableLogging) console.log("[BatchUser]", ...args);
+}
 
 function arrayToCSV(data, headers) {
   const escape = (v) => '"' + String(v).replace(/"/g, '""') + '"';
@@ -362,7 +369,7 @@ document.addEventListener("DOMContentLoaded", () => {
       readOnly: false,
       columns: [{ readOnly: true }, { readOnly: false }],
       stretchH: "all",
-      width: "100%",
+      width: "90%",
       height: 140,
       manualColumnResize: true,
       manualRowResize: true,
@@ -373,6 +380,73 @@ document.addEventListener("DOMContentLoaded", () => {
     if (metaWrap) metaWrap.classList.remove("hidden");
     const metaBtns = document.getElementById("email-btns-inside");
     if (metaBtns) metaBtns.classList.remove("hidden");
+  }
+
+  // Restore toggles from storage
+  chrome.storage?.local?.get(["enableLogging", "enableDryRun"], (res) => {
+    enableLogging = !!res.enableLogging;
+    enableDryRun = !!res.enableDryRun;
+    const logToggle = document.getElementById("loggingToggle");
+    const dryToggle = document.getElementById("dryRunToggle");
+    if (logToggle) logToggle.checked = enableLogging;
+    if (dryToggle) dryToggle.checked = enableDryRun;
+  });
+
+  // Wire toggle changes
+  const logToggle = document.getElementById("loggingToggle");
+  if (logToggle) {
+    logToggle.addEventListener("change", (e) => {
+      enableLogging = !!e.target.checked;
+      chrome.storage?.local?.set({ enableLogging });
+    });
+  }
+  const dryToggle = document.getElementById("dryRunToggle");
+  if (dryToggle) {
+    dryToggle.addEventListener("change", (e) => {
+      enableDryRun = !!e.target.checked;
+      chrome.storage?.local?.set({ enableDryRun });
+    });
+  }
+
+  // Preview modal controls
+  const previewModal = document.getElementById("previewModal");
+  const previewList = document.getElementById("previewList");
+  function openPreview(items) {
+    if (!previewModal || !previewList) return;
+    previewList.innerHTML = "";
+    items.forEach((it, idx) => {
+      const wrap = document.createElement("div");
+      wrap.style.marginBottom = "12px";
+      const title = document.createElement("div");
+      title.textContent = `#${idx + 1} To: ${it.to} — Subject: ${it.subject}`;
+      const pre = document.createElement("pre");
+      pre.textContent = it.body;
+      wrap.appendChild(title);
+      wrap.appendChild(pre);
+      previewList.appendChild(wrap);
+    });
+    previewModal.classList.remove("hidden");
+  }
+  function closePreview() {
+    if (previewModal) previewModal.classList.add("hidden");
+  }
+  const closePreviewBtn = document.getElementById("closePreviewBtn");
+  const closePreviewBtn2 = document.getElementById("closePreviewBtn2");
+  const copyAllBtn = document.getElementById("copyAllBtn");
+  if (closePreviewBtn) closePreviewBtn.addEventListener("click", closePreview);
+  if (closePreviewBtn2) closePreviewBtn2.addEventListener("click", closePreview);
+  if (copyAllBtn) {
+    copyAllBtn.addEventListener("click", async () => {
+      const texts = Array.from(previewList.querySelectorAll("pre")).map(
+        (p) => p.textContent || ""
+      );
+      try {
+        await navigator.clipboard.writeText(texts.join("\n\n"));
+        alert("Copied all previews to clipboard.");
+      } catch (e) {
+        alert("Copy failed: " + e.message);
+      }
+    });
   }
 
   function readEmailMeta() {
@@ -447,9 +521,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!selectedRows.length)
         throw new Error("No valid student emails in selection.");
       const meta = readEmailMeta();
-      const token = await getOAuthToken(true);
       const fromAddress = meta["System"] || "me";
-      let sentCount = 0;
+      const previews = [];
       for (const row of selectedRows) {
         const to = row["studentEmail"];
         const subject = `Access Details for ${meta["System"] || ""}`.trim();
@@ -466,11 +539,19 @@ document.addEventListener("DOMContentLoaded", () => {
           "Please log in and change your password if required.",
         ].filter(Boolean);
         const body = lines.join("\n");
-        const raw = rfc2822Encode({ to, subject, body, from: fromAddress });
-        await sendGmailRaw(raw, token);
-        sentCount++;
+        if (enableDryRun) {
+          previews.push({ to, subject, body });
+        } else {
+          const token = await getOAuthToken(true);
+          const raw = rfc2822Encode({ to, subject, body, from: fromAddress });
+          await sendGmailRaw(raw, token);
+        }
       }
-      alert(`Sent ${sentCount} email(s).`);
+      if (enableDryRun) {
+        openPreview(previews);
+      } else {
+        alert(`Sent ${selectedRows.length} email(s).`);
+      }
     } catch (err) {
       console.error(err);
       alert("Email send failed: " + err.message);
