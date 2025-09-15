@@ -486,6 +486,7 @@ document.addEventListener("DOMContentLoaded", () => {
   loadLogs().then(renderLogs);
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
   const copyLogsBtn = document.getElementById("copyLogsBtn");
+  const downloadLogsBtn = document.getElementById("downloadLogsBtn");
   const clearLogsBtn = document.getElementById("clearLogsBtn");
   if (refreshLogsBtn) refreshLogsBtn.addEventListener("click", async () => { await loadLogs(); renderLogs(); });
   if (copyLogsBtn) copyLogsBtn.addEventListener("click", async () => {
@@ -493,6 +494,22 @@ document.addEventListener("DOMContentLoaded", () => {
       await navigator.clipboard.writeText(debugLogs.join("\n"));
       alert("Logs copied to clipboard.");
     } catch (e) { alert("Copy failed: " + e.message); }
+  });
+  if (downloadLogsBtn) downloadLogsBtn.addEventListener("click", () => {
+    try {
+      const blob = new Blob([debugLogs.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      a.download = `batch-user-logs-${ts}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Download failed: " + e.message);
+    }
   });
   if (clearLogsBtn) clearLogsBtn.addEventListener("click", async () => {
     debugLogs = [];
