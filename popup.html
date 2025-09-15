@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Wider popup viewport to accommodate data table -->
+  <meta name="width" content="900" />
+  <title>Batch SAP User Accounts</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+
+<body>
+  <div id="datatable-container" class="hidden">
+    <label for="dataTable">Paste student data below (tab-separated from Excel):</label>
+    <div id="user-table-container"></div>
+    <!-- Move the buttons inside the table container for better selection detection -->
+    <div class="table-btns hidden" id="table-btns-inside">
+      <button id="modifyUsersBtn">Modify users</button>
+      <button id="changePasswordsBtn">Change passwords</button>
+      <button id="exportTableBtn">Export as CSV</button>
+      <ol>
+        <li>Log in to your SAP site as usual.</li>
+        <li>Select: the SAP Menu &gt; Tools &gt; Administration &gt;
+          User Maintenance &gt; Users.</li>
+        <li>Click the Modify users or Change passwords button.</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- Email metadata table and action -->
+  <div id="emailmeta-container" class="hidden">
+    <h3>Email context</h3>
+    <div id="email-meta-table"></div>
+    <div class="table-btns hidden" id="email-btns-inside">
+      <button id="sendEmailsBtn">Send Emails</button>
+    </div>
+  </div>
+  <link rel="stylesheet" href="handsontable.full.min.css" />
+  <script src="popup.bundle.js"></script>
+  <script>
+    if (typeof setupRefreshPanelButton === 'function') {
+      setupRefreshPanelButton();
+    }
+  </script>
+</body>
+
+</html>
