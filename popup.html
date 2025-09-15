@@ -27,6 +27,17 @@
       </ol>
     </div>
   </div>
+  
+  <!-- Debug panel -->
+  <details id="debugPanel">
+    <summary>Debug logs</summary>
+    <div class="debug-toolbar">
+      <button id="refreshLogsBtn">Refresh</button>
+      <button id="copyLogsBtn">Copy</button>
+      <button id="clearLogsBtn">Clear</button>
+    </div>
+    <div id="debugLogs" class="debug-logs" aria-live="polite"></div>
+  </details>
 
   <!-- Email metadata table and action -->
   <div id="emailmeta-container" class="hidden">

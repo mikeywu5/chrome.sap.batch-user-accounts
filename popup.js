@@ -44,8 +44,41 @@ let lastSelectionRanges = null;
 let enableLogging = false;
 let enableDryRun = false;
 
+function stringifyArg(arg) {
+  if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
+  if (typeof arg === "object") {
+    try { return JSON.stringify(arg); } catch (_) { return String(arg); }
+  }
+  return String(arg);
+}
 function log(...args) {
-  if (enableLogging) console.log("[BatchUser]", ...args);
+  if (!enableLogging) return;
+  const line = args.map(stringifyArg).join(" ");
+  console.log("[BatchUser]", ...args);
+  appendLog(line);
+}
+
+// Debug log buffer and helpers
+const LOG_KEY = "debugLogs";
+let debugLogs = [];
+function appendLog(entry) {
+  const line = `[${new Date().toISOString()}] ${entry}`;
+  debugLogs.push(line);
+  if (debugLogs.length > 500) debugLogs.shift();
+  chrome.storage?.local?.set({ [LOG_KEY]: debugLogs });
+}
+async function loadLogs() {
+  return new Promise((resolve) => {
+    chrome.storage?.local?.get([LOG_KEY], (res) => {
+      debugLogs = Array.isArray(res?.[LOG_KEY]) ? res[LOG_KEY] : [];
+      resolve(debugLogs);
+    });
+  });
+}
+function renderLogs() {
+  const el = document.getElementById("debugLogs");
+  if (!el) return;
+  el.textContent = debugLogs.join("\n");
 }
 
 function arrayToCSV(data, headers) {
@@ -448,6 +481,32 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
   }
+
+  // Debug panel controls
+  loadLogs().then(renderLogs);
+  const refreshLogsBtn = document.getElementById("refreshLogsBtn");
+  const copyLogsBtn = document.getElementById("copyLogsBtn");
+  const clearLogsBtn = document.getElementById("clearLogsBtn");
+  if (refreshLogsBtn) refreshLogsBtn.addEventListener("click", async () => { await loadLogs(); renderLogs(); });
+  if (copyLogsBtn) copyLogsBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(debugLogs.join("\n"));
+      alert("Logs copied to clipboard.");
+    } catch (e) { alert("Copy failed: " + e.message); }
+  });
+  if (clearLogsBtn) clearLogsBtn.addEventListener("click", async () => {
+    debugLogs = [];
+    await chrome.storage?.local?.set({ [LOG_KEY]: debugLogs });
+    renderLogs();
+  });
+
+  // Listen for logs from content script
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === "DEBUG_LOG" && typeof msg.payload === "string") {
+      appendLog(msg.payload);
+      renderLogs();
+    }
+  });
 
   function readEmailMeta() {
     if (!metaHot) return {};
