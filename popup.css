@@ -1,0 +1,50 @@
+/* Style for the Open as Side Panel button */
+#openSidePanelBtn {
+  float: right;
+}
+
+/* Hide elements by default */
+.hidden {
+  display: none;
+}
+
+.shown {
+  display: block;
+}
+
+/* Add margin for table buttons */
+.table-btns {
+  margin-top: 8px;
+  display: flex;
+  gap: 0.5em;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+/* Add styles from popup.html */
+body {
+  font-family: Arial, sans-serif;
+  /* Make the popup wider for better table visibility */
+  min-width: 99vw;
+  padding: 1vw;
+  box-sizing: border-box;
+}
+
+button {
+  margin-top: 10px;
+}
+
+/* Ensure any table container can stretch */
+#hot {
+  width: 100%;
+  min-width: 800px;
+  max-width: 100%;
+}
+
+#datatable-container {
+  margin-top: 16px;
+}
+
+#user-table-container {
+  position: relative;
+}
