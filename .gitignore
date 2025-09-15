@@ -13,6 +13,8 @@ dist/
 build/
 *.bundle.js.map
 *.map
+# Ignore any bundle outputs only at the repository root (not nested)
+/*.bundle.js
 
 ### Chrome Extension Dev ###
 # Temporary packed extension files
