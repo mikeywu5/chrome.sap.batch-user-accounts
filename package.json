@@ -4,7 +4,9 @@
   "description": "A Chrome extension to batch manage user accounts.",
   "main": "background.js",
   "scripts": {
-    "build": "echo 'No build step required'",
+    "build": "webpack --mode production",
+    "dev": "webpack --mode development --watch",
+    "clean": "rm -f /*.bundle.js *.bundle.js.map || true",
     "start": "echo 'Load the extension in Chrome via chrome://extensions'"
   },
   "author": "",
