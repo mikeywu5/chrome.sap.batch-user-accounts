@@ -1,0 +1,71 @@
+### Node / Dependency ###
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+### Build Artifacts ###
+dist/
+build/
+*.bundle.js.map
+*.map
+
+### Chrome Extension Dev ###
+# Temporary packed extension files
+*.crx
+*.pem
+*.zip
+
+### Local Environment / Credentials ###
+.env
+.env.*
+!.env.example
+credentials.json
+oauth_client_secrets.json
+
+### OS / Editor ###
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+*.swp
+*.swo
+*.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+### Logs & Coverage ###
+logs/
+*.log
+coverage/
+coverage-final.json
+lcov.info
+
+### Misc ###
+*.tgz
+*.tar.gz
+*.orig
+*.rej
+*.bak
+*.tmp
+~$*
+
+### Ignore dotfiles by default except a whitelist ###
+.*
+!/.gitignore
+!/.npmrc
+!/.eslintrc*
+!/.prettierrc*
+!/.editorconfig
+
+# End of file
