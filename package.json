@@ -1,0 +1,24 @@
+{
+  "name": "chrome-batch-user-accounts-extension",
+  "version": "1.0.0",
+  "description": "A Chrome extension to batch manage user accounts.",
+  "main": "background.js",
+  "scripts": {
+    "build": "echo 'No build step required'",
+    "start": "echo 'Load the extension in Chrome via chrome://extensions'"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "@babel/core": "^7.28.4",
+    "@babel/preset-env": "^7.28.3",
+    "babel-loader": "^10.0.0",
+    "css-loader": "^7.1.2",
+    "handsontable": "^16.0.1",
+    "style-loader": "^4.0.0",
+    "webpack": "^5.101.3"
+  }
+}
