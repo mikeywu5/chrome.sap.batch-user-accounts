@@ -1,4 +1,7 @@
-# Keep secrets out of Cursor indexing / Agent / Tab context
+# Secrets: ignore values in real env files.
+# Keys are indexed via .env.example (generated/kept without secret values).
 .env
 .env.*
 !.env.example
+!**/.env.example
+!*.env.example
