@@ -77,3 +77,7 @@ lcov.info
 !/.env.example
 
 # End of file
+
+!/.cursor/
+!/.cursor/rules/
+!/.cursor/rules/**

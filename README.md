@@ -79,7 +79,8 @@ Drive the same batch actions from a terminal instead of the extension popup.
 ```bash
 npm install
 npm run build
-cp .env.example .env   # set SAP_URL locally; .env is ignored by git/Cursor
+cp .env.example .env   # set SAP_URL locally; see docs/ENV.md
+# .env is ignored by git/Cursor; .env.example lists key names only
 
 # Open SAP with the unpacked extension loaded
 npm run cli -- open --url "$SAP_URL" --keep-open
