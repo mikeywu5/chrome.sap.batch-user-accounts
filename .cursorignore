@@ -1,7 +1,8 @@
-# Secrets: ignore values in real env files.
-# Keys are indexed via .env.example (generated/kept without secret values).
+# Secrets: ignore real env files (values).
+# Index names via keys-only templates: .env.example / .env.*.example
 .env
 .env.*
 !.env.example
 !**/.env.example
-!*.env.example
+!.env.*.example
+!**/.env.*.example
