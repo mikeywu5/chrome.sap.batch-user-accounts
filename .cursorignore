@@ -1,0 +1,4 @@
+# Keep secrets out of Cursor indexing / Agent / Tab context
+.env
+.env.*
+!.env.example

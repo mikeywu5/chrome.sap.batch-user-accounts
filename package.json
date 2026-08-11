@@ -3,15 +3,21 @@
   "version": "1.0.0",
   "description": "A Chrome extension to batch manage user accounts.",
   "main": "background.js",
+  "bin": {
+    "sap-batch": "./cli/sap-batch.js"
+  },
   "scripts": {
     "build": "webpack --mode production",
     "dev": "webpack --mode development --watch",
     "clean": "rm -f /*.bundle.js *.bundle.js.map || true",
-    "start": "echo 'Load the extension in Chrome via chrome://extensions'"
+    "start": "echo 'Load the extension in Chrome via chrome://extensions'",
+    "cli": "node cli/sap-batch.js",
+    "sap-batch": "node cli/sap-batch.js"
   },
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "baseline-browser-mapping": "^2.10.13",
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
@@ -19,8 +25,15 @@
     "@babel/preset-env": "^7.28.3",
     "babel-loader": "^10.0.0",
     "css-loader": "^7.1.2",
+    "dotenv": "^16.6.1",
     "handsontable": "^16.0.1",
+    "js-beautify": "^1.15.4",
+    "monaco-editor": "^0.53.0",
+    "monaco-editor-webpack-plugin": "^7.1.0",
+    "puppeteer": "^24.43.1",
     "style-loader": "^4.0.0",
+    "tinymce": "^7.4.1",
+    "update": "^0.4.2",
     "webpack": "^5.101.3"
   }
 }
