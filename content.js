@@ -61,7 +61,12 @@ function registerEmbeddedPaneHeightListener() {
 
   window.addEventListener("message", (event) => {
     const data = event?.data;
-    if (!data || data.type !== EMBEDDED_IFRAME_HEIGHT_MESSAGE_TYPE) return;
+    const heightTypes = new Set([
+      EMBEDDED_IFRAME_HEIGHT_MESSAGE_TYPE,
+      "SAP_LOOKUP_IFRAME_HEIGHT",
+      "BATCH_EMBEDDED_IFRAME_HEIGHT",
+    ]);
+    if (!data || !heightTypes.has(data.type)) return;
     const iframe = document.getElementById("batch-user-embedded-pane-frame");
     if (!iframe || event.source !== iframe.contentWindow) return;
     const nextHeight = Number(data.height || 0);
@@ -256,6 +261,44 @@ function forceTextSelectable(el) {
   el.style.setProperty("-webkit-user-select", "text", "important");
 }
 
+function isDockerPuppeteerExtension() {
+  try {
+    const manifest = chrome.runtime.getManifest?.() || {};
+    const blob = `${manifest.name || ""} ${manifest.description || ""}`;
+    return /docker|puppeteer/i.test(blob);
+  } catch (_) {
+    return false;
+  }
+}
+
+function resolveEmbeddedPaneUrl() {
+  // Docker / online: embed the sap.mywu.net credential lookup iframe.
+  // Chrome store build keeps the full popup.html editor.
+  if (isDockerPuppeteerExtension()) {
+    return "https://sap.mywu.net/lookup?embed=1";
+  }
+  return chrome.runtime.getURL("popup.html");
+}
+
+function buildEmbeddedFallbackNote() {
+  const note = document.createElement("div");
+  note.id = "batch-user-embedded-pane-fallback";
+  note.style.padding = "12px";
+  note.style.border = "1px solid #ccd6e6";
+  note.style.borderRadius = "6px";
+  note.style.background = "#fff";
+  note.style.color = "#334155";
+  note.style.fontSize = "13px";
+  note.style.lineHeight = "1.45";
+  note.innerHTML =
+    "<strong>SAP credential lookup</strong><br>" +
+    'Open <a href="https://sap.mywu.net/lookup?embed=1" target="_blank" rel="noopener">sap.mywu.net/lookup?embed=1</a> ' +
+    "(iframe <code>#credPreview</code>) or the full console at " +
+    '<a href="https://sap.mywu.net/teach" target="_blank" rel="noopener">sap.mywu.net/teach</a>.';
+  forceTextSelectable(note);
+  return note;
+}
+
 function buildSearchPanel() {
   const panel = document.createElement("div");
   panel.id = "batch-user-search-panel";
@@ -354,13 +397,27 @@ function buildSearchPanel() {
 
   const embeddedPaneFrame = document.createElement("iframe");
   embeddedPaneFrame.id = "batch-user-embedded-pane-frame";
-  embeddedPaneFrame.src = chrome.runtime.getURL("popup.html");
+  embeddedPaneFrame.src = resolveEmbeddedPaneUrl();
   embeddedPaneFrame.style.width = "100%";
   embeddedPaneFrame.style.height = "240px";
   embeddedPaneFrame.style.border = "1px solid #ccd6e6";
   embeddedPaneFrame.style.borderRadius = "6px";
   embeddedPaneFrame.style.background = "#fff";
   embeddedPaneFrame.setAttribute("scrolling", "no");
+  embeddedPaneFrame.addEventListener("error", () => {
+    embeddedPaneFrame.replaceWith(buildEmbeddedFallbackNote());
+  });
+  // Chromium often does not fire iframe error; detect blank/failed loads.
+  embeddedPaneFrame.addEventListener("load", () => {
+    try {
+      const href = embeddedPaneFrame.contentWindow?.location?.href || "";
+      if (!href || href === "about:blank") {
+        embeddedPaneFrame.replaceWith(buildEmbeddedFallbackNote());
+      }
+    } catch (_) {
+      /* cross-origin chrome-extension pages are fine */
+    }
+  });
 
   embeddedPaneWrap.appendChild(embeddedPaneTitle);
   embeddedPaneWrap.appendChild(embeddedPaneFrame);
@@ -1049,6 +1106,27 @@ const CLI_RESULT_SOURCE = "sap-batch-cli-result";
 const CLI_LISTENER_FLAG = "__batchUserAccountsCliListenerRegistered";
 
 function runBatchAction(message) {
+  if (message.type === "ENSURE_USERS_MAINTENANCE") {
+    if (isBatchRunning) {
+      return Promise.resolve({
+        success: false,
+        error: "Another batch is already running. Please wait for it to finish.",
+      });
+    }
+    isBatchRunning = true;
+    return ensureUsersMaintenancePage()
+      .then(() => ({
+        success: true,
+        onUsersScreen: isUsersMaintenanceScreen(),
+      }))
+      .catch((err) => ({
+        success: false,
+        error: String(err?.message || err),
+      }))
+      .finally(() => {
+        isBatchRunning = false;
+      });
+  }
   if (message.type === "MODIFY_SAP_USERS" && Array.isArray(message.data)) {
     if (isBatchRunning) {
       return Promise.resolve({
@@ -1075,6 +1153,7 @@ function runBatchAction(message) {
     isBatchRunning = true;
     log("Calling changeSAPPasswords with data:", message.data);
     return changeSAPPasswords(message.data, {
+      overwrite: Boolean(message.overwrite),
       passwordStateContains: message.passwordStateContains,
     })
       .then((results) => ({ success: true, results }))
@@ -1206,8 +1285,214 @@ function buildTelephoneAndExtension(lastName, firstName, maxCombinedAlphaNumeric
   return { telephone, extension };
 }
 
+const USERS_EASY_ACCESS_PATH = [
+  "Tools",
+  "Administration",
+  "User Maintenance", // UI may say "User Management"; matcher accepts both
+  "Users",
+];
+
+const EASY_ACCESS_LABEL_ALIASES = {
+  "user maintenance": ["user maintenance", "user management"],
+  "user management": ["user management", "user maintenance"],
+};
+
+function normalizeMenuLabel(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function isUsersMaintenanceScreen() {
+  const alias =
+    findInputByLabel("Alias") ||
+    document.querySelector(
+      "input[data-hint*='SUID_ST_NODE_LOGONDATA-USERALIAS']"
+    );
+  if (alias && !alias.disabled) return true;
+  const user = findInputByLabel("User");
+  return Boolean(user && !user.disabled);
+}
+
+function findOkCodeInput() {
+  return (
+    document.querySelector(
+      "input[title*='Ok Code' i], input[title*='OK Code' i], input[aria-label*='Ok Code' i], input[data-hint*='okcd' i], input[name*='okcd' i], input[id*='okcd' i]"
+    ) ||
+    findInputByLabel("Ok Code") ||
+    findInputByLabel("OK Code") ||
+    findInputByLabel("Command")
+  );
+}
+
+function findEasyAccessTreeNode(label) {
+  const want = normalizeMenuLabel(label);
+  if (!want) return null;
+  const wantAliases = new Set(
+    (EASY_ACCESS_LABEL_ALIASES[want] || [want]).map((x) => normalizeMenuLabel(x))
+  );
+  const matchesWant = (text) => {
+    if (wantAliases.has(text)) return "exact";
+    for (const alias of wantAliases) {
+      if (text.startsWith(`${alias} `) || text.endsWith(` ${alias}`)) return "soft";
+      if (text.includes(alias) && text.length <= alias.length + 12) return "soft";
+    }
+    return "";
+  };
+
+  // SAP WebGUI Easy Access uses lsTextView spans (ct=TV), not role=treeitem.
+  const textViews = Array.from(
+    document.querySelectorAll("span[ct='TV'], .lsTextView[role='button'], .lsTextView")
+  );
+  let best = null;
+  let bestScore = 0;
+  for (const el of textViews) {
+    if (!el || el.closest("#batch-user-search-panel")) continue;
+    let ls = {};
+    try {
+      ls = JSON.parse(el.getAttribute("lsdata") || "{}");
+    } catch (_) {
+      ls = {};
+    }
+    const fromLs = String(ls["0"] || "").replace(/\s+/g, " ").trim();
+    const raw = fromLs || String(el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!raw || raw.length > 80) continue;
+    const text = normalizeMenuLabel(raw);
+    const hit = matchesWant(text);
+    if (!hit) continue;
+    let score = hit === "exact" ? 100 : 40;
+    if (fromLs && matchesWant(normalizeMenuLabel(fromLs)) === "exact") score += 40;
+    if (el.getAttribute("ct") === "TV") score += 20;
+    if (/lsTextView/i.test(el.className || "")) score += 10;
+    if (String(el.id || "").includes("tree#")) score += 15;
+    const rect = el.getBoundingClientRect?.();
+    if (rect && rect.width > 0 && rect.height > 0) score += 5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = el;
+    }
+  }
+  if (best) return best;
+
+  // Fallback for older ITS themes.
+  const candidates = Array.from(
+    document.querySelectorAll(
+      "[role='treeitem'], [ct='TSN'], .urST4Node, .lsTree__row, .urTreeNode, span, a, div"
+    )
+  );
+  for (const el of candidates) {
+    if (!el || el.closest("#batch-user-search-panel")) continue;
+    const raw = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!raw) continue;
+    if (raw.length > Math.max(48, want.length + 24)) continue;
+    const text = normalizeMenuLabel(raw);
+    if (text !== want && !text.startsWith(`${want} `) && !text.endsWith(` ${want}`)) {
+      if (!(text.includes(want) && text.length <= want.length + 12)) continue;
+    }
+    let score = text === want ? 100 : 40;
+    if (el.getAttribute("role") === "treeitem") score += 25;
+    if (el.getAttribute("ct") === "TSN") score += 20;
+    if (/tree/i.test(el.className || "")) score += 10;
+    const rect = el.getBoundingClientRect?.();
+    if (rect && rect.width > 0 && rect.height > 0) score += 5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = el;
+    }
+  }
+  return best;
+}
+
+async function activateEasyAccessTreeNode(label, { leaf = false } = {}) {
+  const node = await waitFor(() => findEasyAccessTreeNode(label), {
+    timeout: 15000,
+  });
+  const row =
+    node.closest("tr") ||
+    node.closest("[id*='tree#']") ||
+    node.closest("[role='treeitem'], [ct='TSN'], .urST4Node, .lsTree__row, .urTreeNode") ||
+    node;
+  log("Easy Access node:", label, leaf ? "(open)" : "(expand)", node?.id || "");
+  // WebGUI Easy Access: click/dblclick the ct=TV text view itself.
+  const fire = (el) => {
+    if (!el) return;
+    triggerEvent(el, "mousedown");
+    triggerEvent(el, "mouseup");
+    triggerEvent(el, "click");
+    triggerEvent(el, "dblclick");
+    clickSapButton(el);
+  };
+  if (!leaf) {
+    const expander =
+      row.querySelector(
+        "[aria-expanded='false'], .urST4Exp, .lsTree__expander, [title*='Expand' i], [aria-label*='Expand' i], span[ct='IV'], span[ct='BIC']"
+      ) || null;
+    if (expander) clickSapButton(expander);
+    fire(node);
+    await timeout(900);
+    // Wait until this folder's children appear when possible.
+    return;
+  }
+  fire(node);
+  await timeout(1200);
+}
+
+async function openUsersViaOkCode() {
+  let ok = findOkCodeInput();
+  if (!ok) {
+    const cmdToggle =
+      document.querySelector(
+        "[title*='Ok Code' i], [aria-label*='Ok Code' i], [title*='Command Field' i], #ToolbarOkCode"
+      ) || null;
+    if (cmdToggle) {
+      clickSapButton(cmdToggle);
+      await timeout(300);
+      ok = findOkCodeInput();
+    }
+  }
+  if (!ok) throw new Error("OK Code / command field not found");
+  await setInputValueRobust(ok, "/nSU01", { delay: 40 });
+  pressEnterOnElement(ok);
+  await timeout(800);
+}
+
+async function ensureUsersMaintenancePage() {
+  if (isUsersMaintenanceScreen()) {
+    log("Already on Users maintenance (SU01) screen");
+    return;
+  }
+  log(
+    "Navigating Easy Access: Tools > Administration > User Maintenance > Users"
+  );
+  try {
+    for (let i = 0; i < USERS_EASY_ACCESS_PATH.length; i += 1) {
+      const label = USERS_EASY_ACCESS_PATH[i];
+      const leaf = i === USERS_EASY_ACCESS_PATH.length - 1;
+      await activateEasyAccessTreeNode(label, { leaf });
+      if (leaf) break;
+    }
+    await waitFor(() => (isUsersMaintenanceScreen() ? true : null), {
+      timeout: 20000,
+    });
+    log("Opened Users via Easy Access menu");
+    return;
+  } catch (err) {
+    log(
+      "Easy Access menu navigation failed; falling back to /nSU01:",
+      err?.message || err
+    );
+  }
+  await openUsersViaOkCode();
+  await waitFor(() => (isUsersMaintenanceScreen() ? true : null), {
+    timeout: 20000,
+  });
+  log("Opened Users via /nSU01");
+}
+
 // Main batch edit logic
 async function modifySAPUsers(tableData) {
+  await ensureUsersMaintenancePage();
   const results = [];
   let num = 0;
   for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
@@ -1268,15 +1553,21 @@ async function modifySAPUsers(tableData) {
   log("Batch user login update complete!");
   return results;
 }
-// Main batch change passwords logic
+// Main batch initialize / change passwords logic
 async function changeSAPPasswords(tableData, options = {}) {
-  const passwordStateContains = String(options?.passwordStateContains || "").trim();
+  await ensureUsersMaintenancePage();
+  const overwrite = Boolean(options?.overwrite);
+  // Without overwrite: only accounts whose password has not been set by the
+  // student yet (SAP status contains "Initial").
+  const passwordStateContains = overwrite
+    ? ""
+    : String(options?.passwordStateContains || "Initial").trim() || "Initial";
   const results = [];
   let num = 0;
   for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
     try {
       await timeout();
-      log("Changing User: ", ++num, student);
+      log("Initializing password for user:", ++num, student, { overwrite, passwordStateContains });
       const $user = await waitForEditableUserInput();
       await setInputValueRobust($user, student.sapLogin);
       await ensureUserUnlockedIfNeeded();
@@ -1285,19 +1576,17 @@ async function changeSAPPasswords(tableData, options = {}) {
       const passwordStateText = await getPasswordStateText(8000);
       if (!doesPasswordStateContain(passwordStateText, passwordStateContains)) {
         log(
-          "Password state filter mismatch; closing dialog via X",
+          "Password already set; skipping (Overwrite is off)",
           student.sapLogin,
           "state:",
-          passwordStateText,
-          "required contains:",
-          passwordStateContains
+          passwordStateText
         );
         await closePasswordDialogViaX();
         results.push({
           sapLogin: student.sapLogin,
           success: false,
           skipped: true,
-          error: `Password state \"${passwordStateText}\" does not contain \"${passwordStateContains}\"`,
+          error: `Password already set (\"${passwordStateText}\"); enable Overwrite to replace it`,
         });
         continue;
       }
@@ -1318,14 +1607,14 @@ async function changeSAPPasswords(tableData, options = {}) {
       clickSapButton($save);
       // Some SAP dialogs react only to Enter on focused input/toolbar button.
       pressEnterOnElement($confirmPass);
-      log("Changed password for", student.sapLogin);
+      log("Initialized password for", student.sapLogin);
       results.push({ sapLogin: student.sapLogin, success: true });
     } catch (err) {
       const error = String(err?.message || err);
-      log("Password change failed for", student.sapLogin, error);
+      log("Password initialize failed for", student.sapLogin, error);
       results.push({ sapLogin: student.sapLogin, success: false, error });
     }
   }
-  log("Batch change SAP passwords complete!");
+  log("Batch initialize SAP passwords complete!");
   return results;
 }
