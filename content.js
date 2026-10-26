@@ -275,7 +275,7 @@ function resolveEmbeddedPaneUrl() {
   // Docker / online: embed the sap.mywu.net credential lookup iframe.
   // Chrome store build keeps the full popup.html editor.
   if (isDockerPuppeteerExtension()) {
-    return "https://sap.mywu.net/lookup?embed=1";
+    return "https://sap.mywu.net/lookup?embed=1&theme=auto";
   }
   return chrome.runtime.getURL("popup.html");
 }
