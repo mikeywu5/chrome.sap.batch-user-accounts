@@ -1,0 +1,21 @@
+---
+description: SAP batch CLI / extension — which .env keys the user must fill
+globs: .env.example,cli/**/*,README.md
+alwaysApply: false
+---
+
+# Env setup (SAP batch)
+
+Real secrets live in **`.env`** (cursorignored). Edit that file yourself; agents only reference **`.env.example`**.
+
+| Key | Required | What to put |
+|-----|----------|-------------|
+| `SAP_URL` | Yes for CLI | Full SAP WebGUI URL (`…/sap/bc/gui/sap/its/webgui/?sap-client=…`) |
+| `PUPPETEER_EXECUTABLE_PATH` | Optional | Chrome binary if not using default macOS Chrome |
+
+Canvas PAT for messaging is entered in the extension UI (session only), not via `.env`.
+
+```bash
+cp .env.example .env   # then set SAP_URL
+npm run cli -- open --keep-open
+```

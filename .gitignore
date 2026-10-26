@@ -11,6 +11,7 @@ pnpm-lock.yaml
 ### Build Artifacts ###
 dist/
 build/
+bundle/
 *.bundle.js.map
 *.map
 # Ignore any bundle outputs only at the repository root (not nested)
@@ -62,12 +63,21 @@ lcov.info
 *.tmp
 ~$*
 
+### Puppeteer CLI ###
+.puppeteer-profile/
+
 ### Ignore dotfiles by default except a whitelist ###
 .*
 !/.gitignore
+!/.cursorignore
 !/.npmrc
 !/.eslintrc*
 !/.prettierrc*
 !/.editorconfig
+!/.env.example
 
 # End of file
+
+!/.cursor/
+!/.cursor/rules/
+!/.cursor/rules/**
