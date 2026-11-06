@@ -177,23 +177,20 @@ function scheduleSearchPanelInjection(delay = 100) {
   }, delay);
 }
 
+/**
+ * The in-page "Student Search" panel (and its embedded lookup iframe) is no
+ * longer injected onto the SAP WebGUI. It overlapped the SAP dynpro fields and
+ * interfered with password entry, and search/credentials already live on
+ * sap.mywu.net/teach and /lookup. This keeps the page untouched: it only strips
+ * any panel left behind by an earlier version of the extension.
+ *
+ * The Puppeteer/CLI bridge (window.postMessage → runBatchAction) is unaffected —
+ * that path never used the injected UI.
+ */
 function startSearchPanelObserver() {
-  if (searchPanelObserverStarted || !isSapWebGuiPage()) return;
+  if (searchPanelObserverStarted) return;
   searchPanelObserverStarted = true;
-
-  scheduleSearchPanelInjection(50);
-
-  const observer = new MutationObserver(() => {
-    scheduleSearchPanelInjection(120);
-  });
-  observer.observe(document.body || document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
-
-  setInterval(() => {
-    scheduleSearchPanelInjection(0);
-  }, 1500);
+  getSearchPanels().forEach((panel) => panel.remove());
 }
 
 if (document.readyState === "loading") {
@@ -788,10 +785,29 @@ function clickSapButton(button) {
   if (!button) return;
   triggerEvent(button, "mousedown");
   triggerEvent(button, "mouseup");
-  triggerEvent(button, "click");
-  if (typeof button.click === "function") {
-    button.click();
-  }
+  // Exactly one click: dispatching and then calling click() submits twice.
+  if (typeof button.click === "function") button.click();
+  else triggerEvent(button, "click");
+}
+
+/**
+ * The open SAP modal window, or null.
+ *
+ * Modern SAP ITS (S/4HANA Horizon) renders modal windows as `div[role=dialog]`
+ * whose `lsdata` carries a `SID` of `wnd[1]`; the legacy `data-hint="wnd[1]"`
+ * attribute is NOT present. Code that probed only `data-hint` never saw these
+ * dialogs, so unlock/password waits stalled until timeout with the dialog
+ * still open.
+ */
+function findOpenSapDialog() {
+  return (
+    Array.from(document.querySelectorAll("[role='dialog']")).find((el) => {
+      if (!isVisibleInput(el)) return false;
+      const lsdata = String(el.getAttribute("lsdata") || "");
+      const sid = (lsdata.match(/"SID"\s*:\s*"([^"]+)"/) || [])[1] || "";
+      return /wnd\[1\]/i.test(sid) || /SAPLSUID_MAINTENANCE1500/i.test(el.id || "");
+    }) || null
+  );
 }
 
 function findChangePasswordActionButton() {
@@ -836,44 +852,122 @@ function findLockUnlockActionButton() {
   });
 }
 
+/**
+ * The lock status line inside the "Lock User" dialog.
+ *
+ * S/4HANA Horizon renders it as a plain dynpro text field:
+ *   <span id="M1:46:::0:0-text" class="lsDynproTextField__text">Not locked.</span>
+ * It is neither `[role=button]` nor `.lsLabel`, so the previous selector list
+ * never matched and `ensureUserUnlockedIfNeeded` stalled until timeout while
+ * leaving the dialog open — the reset never reached the password pane.
+ */
 function findUnlockDialogStatusLabel() {
-  return Array.from(document.querySelectorAll("[role='button'], .lsLabel, [ct='L']")).find(
-    (el) => {
-      const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
-      return /\bnot\s+locked\b/i.test(text) || /\blocked\b/i.test(text);
-    }
+  const dialog = findOpenSapDialog();
+  const scope = dialog || document;
+  const candidates = Array.from(
+    scope.querySelectorAll(
+      ".lsDynproTextField__text, .lsDynproTextField, [role='button'], .lsLabel, [ct='L'], [ct='DTF']"
+    )
   );
+  return candidates.find((el) => {
+    if (!isVisibleInput(el)) return false;
+    const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    return /\bnot\s+locked\b/i.test(text) || /^\s*locked\b/i.test(text) || /\blocked\b/i.test(text);
+  });
+}
+
+/** Best-scoring button within the open dialog (falls back to the page). */
+function findButtonInOpenDialog(scoreFn) {
+  const dialog = findOpenSapDialog();
+  if (!dialog) return findBestActionButton(scoreFn);
+  let winner = null;
+  let bestScore = 0;
+  for (const candidate of dialog.querySelectorAll("[role='button'], button")) {
+    const signals = getButtonSignals(candidate);
+    const score = Number(scoreFn(signals) || 0);
+    if (score > bestScore) {
+      bestScore = score;
+      winner = candidate;
+    }
+  }
+  return winner;
 }
 
 function findUnlockDialogCancelButton() {
-  return findBestActionButton((s) => {
+  return findButtonInOpenDialog((s) => {
     let score = 0;
     if (/\bcancel\b/.test(s.combined)) score += 6;
     if (/escape/.test(s.combined)) score += 6;
     if (/escape/.test(s.lsdata)) score += 12;
     if (/"18"\s*:\s*"escape"/.test(s.lsdata)) score += 16;
-    if (/wnd\[1\]/.test(s.dataHint)) score += 3;
     return score;
   });
 }
 
 function findUnlockDialogUnlockButton() {
-  return findBestActionButton((s) => {
+  return findButtonInOpenDialog((s) => {
     let score = 0;
     if (/\bunlock\b/.test(s.combined)) score += 10;
     if (/\(f7\)/.test(s.combined)) score += 6;
     if (/"18"\s*:\s*"f7"/.test(s.lsdata) || /\bf7\b/.test(s.lsdata)) score += 12;
-    if (/wnd\[1\]/.test(s.dataHint)) score += 3;
     return score;
   });
 }
 
+/**
+ * True when a SAP modal ("secondary window") is open.
+ *
+ * Modern ITS modal windows have no `data-hint="wnd[1]"`; they are
+ * `div[role=dialog]` with an `lsdata` SID of `wnd[1]`. Relying on data-hint
+ * alone made this always false, so `waitForSecondaryWindowToClose` resolved
+ * instantly and callers could act while a dialog was still up.
+ */
 function isSecondaryWindowVisible() {
-  return !!document.querySelector("[data-hint*='wnd[1]']");
+  if (findOpenSapDialog()) return true;
+  if (document.querySelector("[data-hint*='wnd[1]']")) return true;
+  return Array.from(document.querySelectorAll("[role='dialog']")).some((el) =>
+    isVisibleInput(el)
+  );
 }
 
 async function waitForSecondaryWindowToClose(timeoutMs = 10000) {
-  await waitFor(() => !isSecondaryWindowVisible(), { timeout: timeoutMs });
+  try {
+    await waitFor(() => !isSecondaryWindowVisible(), { timeout: timeoutMs });
+  } catch (_) {
+    // Do not hard-fail a batch on a lingering dialog; best-effort dismiss it.
+    await dismissOpenSapDialog();
+  }
+}
+
+/**
+ * Cancel/Escape any open SAP dialog so a stale window from a previous run
+ * cannot block the next step. Never throws.
+ */
+async function dismissOpenSapDialog() {
+  const dialog = findOpenSapDialog();
+  if (!dialog) return false;
+  const $cancel =
+    findButtonInOpenDialog((s) => {
+      let score = 0;
+      if (/escape/.test(s.lsdata)) score += 12;
+      if (/"18"\s*:\s*"escape"/.test(s.lsdata)) score += 16;
+      if (/\bcancel\b/.test(s.combined)) score += 6;
+      if (/escape/.test(s.combined)) score += 6;
+      return score;
+    }) || dialog.querySelector("[role='button'][title*='Cancel' i]");
+  if ($cancel) {
+    log("Dismissing stale SAP dialog via Cancel/Escape");
+    clickSapButton($cancel);
+  } else {
+    log("Dismissing stale SAP dialog via Escape key");
+    pressEscapeOnElement(dialog);
+  }
+  try {
+    await waitFor(() => !isSecondaryWindowVisible(), { timeout: 4000 });
+  } catch (_) {
+    /* leave it; the caller will re-detect */
+  }
+  return true;
 }
 
 async function activateChangePasswordAndWaitForInput(anchorElement) {
@@ -901,6 +995,13 @@ async function activateChangePasswordAndWaitForInput(anchorElement) {
 }
 
 async function ensureUserUnlockedIfNeeded() {
+  // A stale Lock/Unlock dialog from an earlier attempt would swallow the next
+  // action; clear it before doing anything else.
+  if (findOpenSapDialog()) {
+    log("Unlock step: clearing a leftover SAP dialog before starting");
+    await dismissOpenSapDialog();
+  }
+
   const $lockUnlock = findLockUnlockActionButton();
   if (!$lockUnlock) {
     log("Lock/Unlock button not found; continuing without unlock step");
@@ -909,21 +1010,25 @@ async function ensureUserUnlockedIfNeeded() {
 
   log("Unlock step: activating Lock/Unlock action");
   clickSapButton($lockUnlock);
-  await timeout();
 
-  const $status = await waitFor(() => findUnlockDialogStatusLabel(), {
-    timeout: 10000,
-  });
-  const statusText = String($status?.textContent || "").replace(/\s+/g, " ").trim();
+  // Wait for the dialog itself, then read its status line (which is a dynpro
+  // text field, not a button/label — see findUnlockDialogStatusLabel).
+  let statusText = "";
+  try {
+    const $status = await waitFor(() => findUnlockDialogStatusLabel(), {
+      timeout: 12000,
+    });
+    statusText = String($status?.textContent || "").replace(/\s+/g, " ").trim();
+  } catch (err) {
+    log("Unlock step: dialog status not found; dismissing and continuing", String(err?.message || err));
+    await dismissOpenSapDialog();
+    return;
+  }
   log("Unlock step: status detected", statusText);
 
   if (/\bnot\s+locked\b/i.test(statusText)) {
-    const $cancel = await waitFor(() => findUnlockDialogCancelButton(), {
-      timeout: 10000,
-    });
     log("Unlock step: user already unlocked, closing dialog via Cancel/Escape");
-    clickSapButton($cancel);
-    await waitForSecondaryWindowToClose();
+    await dismissOpenSapDialog();
     return;
   }
 
@@ -981,6 +1086,20 @@ function pressEnterOnElement(element) {
   triggerEvent(element, "keyup", options);
 }
 
+function pressEscapeOnElement(element) {
+  if (!element) return;
+  const options = {
+    bubbles: true,
+    cancelable: true,
+    key: "Escape",
+    code: "Escape",
+    keyCode: 27,
+    which: 27,
+  };
+  triggerEvent(element, "keydown", options);
+  triggerEvent(element, "keyup", options);
+}
+
 function pressShiftF8OnElement(element) {
   if (!element) return;
   const options = {
@@ -1002,26 +1121,84 @@ function isVisibleInput(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
-function findVisiblePasswordInputs() {
-  return Array.from(document.querySelectorAll("input[type='password']")).filter(
-    isVisibleInput
+/**
+ * A password field belonging to a Keycloak / SSO / generic web login form.
+ *
+ * The SAP page can carry a Keycloak-protected frame (the credential lookup the
+ * extension embeds). A document-wide `input[type=password]` scan then matches
+ * Keycloak's "Password" box instead of SAP's Change Password dialog, so the
+ * batch types the SAP password into the SSO form. These are never SAP controls.
+ */
+function isForeignLoginPasswordField(el) {
+  if (!el || el.nodeType !== 1) return false;
+  // Our own injected search panel holds no SAP controls.
+  if (el.closest("#batch-user-search-panel")) return true;
+  // Keycloak (PatternFly) and typical SSO login forms.
+  if (
+    el.closest(
+      "#kc-form, #kc-form-login, #kc-form-wrapper, .pf-c-login, .pf-v5-c-login, " +
+        "form[action*='login'], form[action*='/auth'], form[id*='kc-form']"
+    )
+  ) {
+    return true;
+  }
+  // A SAP dynpro field always carries a data-hint / lsdata path. A password box
+  // with none of that, keyed like a login form, is the SSO field.
+  const hint = String(
+    el.getAttribute("data-hint") || el.getAttribute("lsdata") || ""
+  );
+  if (hint) return false;
+  const autocomplete = String(el.getAttribute("autocomplete") || "").toLowerCase();
+  const name = String(el.getAttribute("name") || "").toLowerCase();
+  const id = String(el.id || "").toLowerCase();
+  if (autocomplete === "current-password") return true;
+  const loginNames = new Set(["password", "kc-password", "user_password", "pass"]);
+  return loginNames.has(name) || loginNames.has(id);
+}
+
+/**
+ * Scope for SAP Change Password fields: the open SAP dialog (modern ITS renders
+ * it as `div[role=dialog]`; legacy uses `data-hint="wnd[1]"`), else the page.
+ */
+function sapPasswordSearchRoot() {
+  const dialog = findOpenSapDialog();
+  if (dialog) return dialog;
+  const legacy = document.querySelector("[data-hint*='wnd[1]']");
+  if (legacy && typeof legacy.querySelectorAll === "function") return legacy;
+  return document.body;
+}
+
+function findVisiblePasswordInputs(root) {
+  const scope = root || sapPasswordSearchRoot();
+  if (!scope || typeof scope.querySelectorAll !== "function") return [];
+  return Array.from(scope.querySelectorAll("input[type='password']")).filter(
+    (el) => isVisibleInput(el) && !isForeignLoginPasswordField(el)
   );
 }
 
+/** Accept a located field only when it is not a Keycloak/SSO login box. */
+function acceptSapPasswordField(el) {
+  if (!el) return null;
+  return isForeignLoginPasswordField(el) ? null : el;
+}
+
 function findNewPasswordInput() {
+  const scope = sapPasswordSearchRoot();
   return (
-    findInputByLabel("New Password") ||
-    findInputByLabel("Password") ||
-    findVisiblePasswordInputs()[0] ||
+    acceptSapPasswordField(findInputByLabel(/new\s*password/i, scope)) ||
+    // A bare "Password" label is loose, so only trust it inside the SAP scope.
+    acceptSapPasswordField(findInputByLabel(/^\s*password\s*$/i, scope)) ||
+    findVisiblePasswordInputs(scope)[0] ||
     null
   );
 }
 
 function findRepeatPasswordInput() {
+  const scope = sapPasswordSearchRoot();
   return (
-    findInputByLabel("Repeat Password") ||
-    findInputByLabel("Retype Password") ||
-    findVisiblePasswordInputs()[1] ||
+    acceptSapPasswordField(findInputByLabel(/repeat\s*password/i, scope)) ||
+    acceptSapPasswordField(findInputByLabel(/retype\s*password/i, scope)) ||
+    findVisiblePasswordInputs(scope)[1] ||
     null
   );
 }
@@ -1061,6 +1238,18 @@ function doesPasswordStateContain(passwordStateText, containsValue) {
   return String(passwordStateText || "")
     .toLowerCase()
     .includes(filterValue.toLowerCase());
+}
+
+/** SU01: "Initial Password (Set by Administrator)", not "Production Password". */
+function passwordStatusIsInitial(text) {
+  return /\binitial\b/i.test(String(text || ""));
+}
+
+/** Pause 0.45s–1.6s so each account is checked like a person, not a tight loop. */
+function humanPause() {
+  const ms = 450 + Math.floor(Math.random() * 1150);
+  log("Human pause", ms);
+  return timeout(ms);
 }
 
 function findPasswordDialogCancelButton() {
@@ -1497,7 +1686,7 @@ async function modifySAPUsers(tableData) {
   let num = 0;
   for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
     try {
-      await timeout();
+      await humanPause();
       log("Modding User: ", ++num, student);
       const $user = await waitForEditableUserInput();
       await setInputValueRobust($user, student.sapLogin);
@@ -1566,17 +1755,18 @@ async function changeSAPPasswords(tableData, options = {}) {
   let num = 0;
   for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
     try {
-      await timeout();
+      await humanPause();
       log("Initializing password for user:", ++num, student, { overwrite, passwordStateContains });
       const $user = await waitForEditableUserInput();
       await setInputValueRobust($user, student.sapLogin);
       await ensureUserUnlockedIfNeeded();
       await setInputValueRobust($user, student.sapLogin);
       const $newPass = await activateChangePasswordAndWaitForInput($user);
+      await humanPause();
       const passwordStateText = await getPasswordStateText(8000);
       if (!doesPasswordStateContain(passwordStateText, passwordStateContains)) {
         log(
-          "Password already set; skipping (Overwrite is off)",
+          "Password already set; skipping (Override production password is off)",
           student.sapLogin,
           "state:",
           passwordStateText
@@ -1586,10 +1776,13 @@ async function changeSAPPasswords(tableData, options = {}) {
           sapLogin: student.sapLogin,
           success: false,
           skipped: true,
-          error: `Password already set (\"${passwordStateText}\"); enable Overwrite to replace it`,
+          validated: false,
+          passwordState: passwordStateText,
+          error: `Password already set (\"${passwordStateText}\"); tick Override production password to replace it`,
         });
         continue;
       }
+      await humanPause();
       log("Password 2/4: waiting for New Password input");
       await setInputValueRobust($newPass, student.sapPassword);
       log("Password 3/4: waiting for Repeat Password input");
@@ -1598,7 +1791,7 @@ async function changeSAPPasswords(tableData, options = {}) {
       }
       );
       await setInputValueRobust($confirmPass, student.sapPassword);
-      await timeout();
+      await humanPause();
       log("Password 4/4: waiting for check/confirm action");
       const $save = await waitFor(() => findPasswordDialogConfirmButton(), {
         timeout: 20000,
@@ -1607,12 +1800,60 @@ async function changeSAPPasswords(tableData, options = {}) {
       clickSapButton($save);
       // Some SAP dialogs react only to Enter on focused input/toolbar button.
       pressEnterOnElement($confirmPass);
+      await humanPause();
+      try {
+        await waitFor(() => !isSecondaryWindowVisible(), { timeout: 15000 });
+      } catch (_) {
+        await dismissOpenSapDialog();
+        results.push({
+          sapLogin: student.sapLogin,
+          success: false,
+          validated: false,
+          error: "Password dialog did not close",
+        });
+        continue;
+      }
+      // Second look: the status must now be an initial password, or the table
+      // must stay blank.
+      await humanPause();
+      let confirmed = "";
+      try {
+        await activateChangePasswordAndWaitForInput($user);
+        confirmed = await getPasswordStateText(8000);
+      } catch (err) {
+        await dismissOpenSapDialog();
+        results.push({
+          sapLogin: student.sapLogin,
+          success: false,
+          validated: false,
+          error: "Could not re-check the password status",
+        });
+        continue;
+      }
+      await closePasswordDialogViaX().catch(() => dismissOpenSapDialog());
+      if (!passwordStatusIsInitial(confirmed)) {
+        log("Password was not validated", student.sapLogin, confirmed);
+        results.push({
+          sapLogin: student.sapLogin,
+          success: false,
+          validated: false,
+          passwordState: confirmed,
+          error: `Password was not validated ("${confirmed}")`,
+        });
+        continue;
+      }
       log("Initialized password for", student.sapLogin);
-      results.push({ sapLogin: student.sapLogin, success: true });
+      results.push({
+        sapLogin: student.sapLogin,
+        success: true,
+        validated: true,
+        passwordState: confirmed,
+      });
     } catch (err) {
       const error = String(err?.message || err);
       log("Password initialize failed for", student.sapLogin, error);
-      results.push({ sapLogin: student.sapLogin, success: false, error });
+      await dismissOpenSapDialog().catch(() => {});
+      results.push({ sapLogin: student.sapLogin, success: false, validated: false, error });
     }
   }
   log("Batch initialize SAP passwords complete!");
