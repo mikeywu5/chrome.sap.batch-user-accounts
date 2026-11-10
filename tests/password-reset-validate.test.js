@@ -50,17 +50,24 @@ test("initial status is the only state that counts as validated", () => {
   assert.equal(passwordStatusIsInitial("Password Status"), false);
 });
 
-test("a reset is not success until the dialog is reopened and re-read", () => {
+test("a reset is not success until the status bar confirms, and a miss is retried", () => {
   const fn = extractFunction("changeSAPPasswords");
-  assert.match(fn, /Password was not validated/);
-  assert.match(fn, /Override production password/);
-  assert.match(fn, /validated:\s*true/);
+  const once = extractFunction("setStudentPasswordOnce");
+  assert.match(fn, /Password was not confirmed after retries/);
+  assert.match(fn, /Password set was not confirmed; retrying/);
+  assert.match(once, /Override production password/);
+  assert.match(once, /statusBarConfirmed:\s*true/);
+  assert.match(once, /beginStatusBarWatch\(\)/);
+  assert.match(once, /setSapPasswordField/);
+  assert.match(once, /did not receive the full password/);
+  assert.match(once, /clicking the check without Enter/);
+  assert.match(once, /closing the dialog/);
+  assert.match(once, /The passwords specified must be identical/);
+  assert.doesNotMatch(once, /pressEnterOnElement/);
   assert.match(fn, /humanPause\(\)/);
-  const successAt = fn.indexOf("validated: true");
-  const reopenAt = fn.lastIndexOf("getPasswordStateText", successAt);
-  assert.ok(reopenAt > 0, "the success flag must follow a status re-read");
+  const successAt = once.indexOf("statusBarConfirmed: true");
   assert.ok(
-    fn.indexOf("passwordStatusIsInitial") < successAt,
-    "success must be gated on the initial-status check"
+    once.indexOf("pollPasswordSetConfirmation") < successAt,
+    "success must follow the status-bar read"
   );
 });
