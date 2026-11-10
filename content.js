@@ -1977,6 +1977,29 @@ async function modifySAPUsers(tableData) {
   return results;
 }
 /**
+ * WebGUI commits the focused password field only when it really blurs.
+ * Repeat Password is still focused when Apply is clicked, so the server
+ * receives New Password and an empty Repeat, then says they must be identical.
+ * No key is sent. Moving to the next control or submitting from the keyboard
+ * adds a character to Repeat's buffer.
+ */
+async function commitFocusedPasswordField() {
+  const active = document.activeElement;
+  const tag = active && active.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") {
+    log("Password: blurring the focused field so WebGUI posts it");
+    active.blur();
+  }
+  let left = 500;
+  while (left > 0) {
+    throwIfBatchCancelled();
+    const slice = Math.min(100, left);
+    await timeout(slice);
+    left -= slice;
+  }
+}
+
+/**
  * One attempt to set a student's password.
  * `done: true` means do not retry (confirmed, or a Production password we must
  * leave alone). `done: false` means the status bar never confirmed the change.
@@ -2040,10 +2063,13 @@ async function setStudentPasswordOnce(student, passwordStateContains) {
   }
   await humanPause();
   log("Password 4/4: clicking the check without Enter");
-  // Enter on Repeat Password is an extra keystroke in WebGUI's submit buffer.
-  // The bullets still match, and SAP reports the passwords are not identical.
-  // The green check is the only submit.
+  // WebGUI posts a password field when focus actually leaves it. New Password
+  // blurs as Repeat is focused, so that value is posted. Repeat stays focused,
+  // Apply submits it empty, and the status bar says the passwords must be
+  // identical while both boxes still show the same bullets. Blur Repeat with
+  // no Tab and no Enter, then click the green check.
   const confirmPassword = async () => {
+    await commitFocusedPasswordField();
     const $save = await waitFor(() => findPasswordDialogConfirmButton(), {
       timeout: 20000,
     });

@@ -61,9 +61,18 @@ test("a reset is not success until the status bar confirms, and a miss is retrie
   assert.match(once, /setSapPasswordField/);
   assert.match(once, /did not receive the full password/);
   assert.match(once, /clicking the check without Enter/);
+  assert.match(once, /commitFocusedPasswordField\(\)/);
   assert.match(once, /closing the dialog/);
   assert.match(once, /The passwords specified must be identical/);
   assert.doesNotMatch(once, /pressEnterOnElement/);
+  const confirmAt = once.indexOf("const confirmPassword");
+  const blurAt = once.indexOf("commitFocusedPasswordField", confirmAt);
+  const clickAt = once.indexOf("clickSapButton", confirmAt);
+  assert.ok(blurAt > confirmAt && blurAt < clickAt, "Repeat must blur before Apply");
+  const commit = extractFunction("commitFocusedPasswordField");
+  assert.match(commit, /blurring the focused field so WebGUI posts it/);
+  assert.match(commit, /\.blur\(\)/);
+  assert.doesNotMatch(commit, /Tab|pressEnterOnElement|key:\s*"Enter"/);
   assert.match(fn, /humanPause\(\)/);
   const successAt = once.indexOf("statusBarConfirmed: true");
   assert.ok(
