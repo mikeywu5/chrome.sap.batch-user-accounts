@@ -1,17 +1,35 @@
 console.log("Batch User Accounts content script loaded.");
 const {
   findInputByLabel,
-  waitFor,
+  waitFor: waitForBase,
   waitForElement,
   findButtonByContent,
   triggerEvent,
   typeValue,
   setInputValueRobust,
+  setSapPasswordField,
   timeout,
 } = require("./domHelpers");
 
 let enableLogging = false;
 let isBatchRunning = false;
+/** Set by Cancel while a modify / password batch is in the content script. */
+let batchCancelRequested = false;
+
+function throwIfBatchCancelled() {
+  if (!batchCancelRequested) return;
+  const err = new Error("Batch cancelled");
+  err.code = "cancelled";
+  throw err;
+}
+
+/** Same as waitFor, but a cancel ends the wait instead of polling until timeout. */
+function waitFor(callback, options) {
+  return waitForBase(() => {
+    throwIfBatchCancelled();
+    return callback();
+  }, options);
+}
 const LISTENER_FLAG = "__batchUserAccountsListenerRegistered";
 let searchPanelObserverStarted = false;
 let searchPanelInjectInFlight = false;
@@ -177,23 +195,20 @@ function scheduleSearchPanelInjection(delay = 100) {
   }, delay);
 }
 
+/**
+ * The in-page "Student Search" panel (and its embedded lookup iframe) is no
+ * longer injected onto the SAP WebGUI. It overlapped the SAP dynpro fields and
+ * interfered with password entry, and search/credentials already live on
+ * sap.mywu.net/teach and /lookup. This keeps the page untouched: it only strips
+ * any panel left behind by an earlier version of the extension.
+ *
+ * The Puppeteer/CLI bridge (window.postMessage → runBatchAction) is unaffected —
+ * that path never used the injected UI.
+ */
 function startSearchPanelObserver() {
-  if (searchPanelObserverStarted || !isSapWebGuiPage()) return;
+  if (searchPanelObserverStarted) return;
   searchPanelObserverStarted = true;
-
-  scheduleSearchPanelInjection(50);
-
-  const observer = new MutationObserver(() => {
-    scheduleSearchPanelInjection(120);
-  });
-  observer.observe(document.body || document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
-
-  setInterval(() => {
-    scheduleSearchPanelInjection(0);
-  }, 1500);
+  getSearchPanels().forEach((panel) => panel.remove());
 }
 
 if (document.readyState === "loading") {
@@ -788,10 +803,29 @@ function clickSapButton(button) {
   if (!button) return;
   triggerEvent(button, "mousedown");
   triggerEvent(button, "mouseup");
-  triggerEvent(button, "click");
-  if (typeof button.click === "function") {
-    button.click();
-  }
+  // Exactly one click: dispatching and then calling click() submits twice.
+  if (typeof button.click === "function") button.click();
+  else triggerEvent(button, "click");
+}
+
+/**
+ * The open SAP modal window, or null.
+ *
+ * Modern SAP ITS (S/4HANA Horizon) renders modal windows as `div[role=dialog]`
+ * whose `lsdata` carries a `SID` of `wnd[1]`; the legacy `data-hint="wnd[1]"`
+ * attribute is NOT present. Code that probed only `data-hint` never saw these
+ * dialogs, so unlock/password waits stalled until timeout with the dialog
+ * still open.
+ */
+function findOpenSapDialog() {
+  return (
+    Array.from(document.querySelectorAll("[role='dialog']")).find((el) => {
+      if (!isVisibleInput(el)) return false;
+      const lsdata = String(el.getAttribute("lsdata") || "");
+      const sid = (lsdata.match(/"SID"\s*:\s*"([^"]+)"/) || [])[1] || "";
+      return /wnd\[1\]/i.test(sid) || /SAPLSUID_MAINTENANCE1500/i.test(el.id || "");
+    }) || null
+  );
 }
 
 function findChangePasswordActionButton() {
@@ -836,44 +870,122 @@ function findLockUnlockActionButton() {
   });
 }
 
+/**
+ * The lock status line inside the "Lock User" dialog.
+ *
+ * S/4HANA Horizon renders it as a plain dynpro text field:
+ *   <span id="M1:46:::0:0-text" class="lsDynproTextField__text">Not locked.</span>
+ * It is neither `[role=button]` nor `.lsLabel`, so the previous selector list
+ * never matched and `ensureUserUnlockedIfNeeded` stalled until timeout while
+ * leaving the dialog open — the reset never reached the password pane.
+ */
 function findUnlockDialogStatusLabel() {
-  return Array.from(document.querySelectorAll("[role='button'], .lsLabel, [ct='L']")).find(
-    (el) => {
-      const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
-      return /\bnot\s+locked\b/i.test(text) || /\blocked\b/i.test(text);
-    }
+  const dialog = findOpenSapDialog();
+  const scope = dialog || document;
+  const candidates = Array.from(
+    scope.querySelectorAll(
+      ".lsDynproTextField__text, .lsDynproTextField, [role='button'], .lsLabel, [ct='L'], [ct='DTF']"
+    )
   );
+  return candidates.find((el) => {
+    if (!isVisibleInput(el)) return false;
+    const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    return /\bnot\s+locked\b/i.test(text) || /^\s*locked\b/i.test(text) || /\blocked\b/i.test(text);
+  });
+}
+
+/** Best-scoring button within the open dialog (falls back to the page). */
+function findButtonInOpenDialog(scoreFn) {
+  const dialog = findOpenSapDialog();
+  if (!dialog) return findBestActionButton(scoreFn);
+  let winner = null;
+  let bestScore = 0;
+  for (const candidate of dialog.querySelectorAll("[role='button'], button")) {
+    const signals = getButtonSignals(candidate);
+    const score = Number(scoreFn(signals) || 0);
+    if (score > bestScore) {
+      bestScore = score;
+      winner = candidate;
+    }
+  }
+  return winner;
 }
 
 function findUnlockDialogCancelButton() {
-  return findBestActionButton((s) => {
+  return findButtonInOpenDialog((s) => {
     let score = 0;
     if (/\bcancel\b/.test(s.combined)) score += 6;
     if (/escape/.test(s.combined)) score += 6;
     if (/escape/.test(s.lsdata)) score += 12;
     if (/"18"\s*:\s*"escape"/.test(s.lsdata)) score += 16;
-    if (/wnd\[1\]/.test(s.dataHint)) score += 3;
     return score;
   });
 }
 
 function findUnlockDialogUnlockButton() {
-  return findBestActionButton((s) => {
+  return findButtonInOpenDialog((s) => {
     let score = 0;
     if (/\bunlock\b/.test(s.combined)) score += 10;
     if (/\(f7\)/.test(s.combined)) score += 6;
     if (/"18"\s*:\s*"f7"/.test(s.lsdata) || /\bf7\b/.test(s.lsdata)) score += 12;
-    if (/wnd\[1\]/.test(s.dataHint)) score += 3;
     return score;
   });
 }
 
+/**
+ * True when a SAP modal ("secondary window") is open.
+ *
+ * Modern ITS modal windows have no `data-hint="wnd[1]"`; they are
+ * `div[role=dialog]` with an `lsdata` SID of `wnd[1]`. Relying on data-hint
+ * alone made this always false, so `waitForSecondaryWindowToClose` resolved
+ * instantly and callers could act while a dialog was still up.
+ */
 function isSecondaryWindowVisible() {
-  return !!document.querySelector("[data-hint*='wnd[1]']");
+  if (findOpenSapDialog()) return true;
+  if (document.querySelector("[data-hint*='wnd[1]']")) return true;
+  return Array.from(document.querySelectorAll("[role='dialog']")).some((el) =>
+    isVisibleInput(el)
+  );
 }
 
 async function waitForSecondaryWindowToClose(timeoutMs = 10000) {
-  await waitFor(() => !isSecondaryWindowVisible(), { timeout: timeoutMs });
+  try {
+    await waitFor(() => !isSecondaryWindowVisible(), { timeout: timeoutMs });
+  } catch (_) {
+    // Do not hard-fail a batch on a lingering dialog; best-effort dismiss it.
+    await dismissOpenSapDialog();
+  }
+}
+
+/**
+ * Cancel/Escape any open SAP dialog so a stale window from a previous run
+ * cannot block the next step. Never throws.
+ */
+async function dismissOpenSapDialog() {
+  const dialog = findOpenSapDialog();
+  if (!dialog) return false;
+  const $cancel =
+    findButtonInOpenDialog((s) => {
+      let score = 0;
+      if (/escape/.test(s.lsdata)) score += 12;
+      if (/"18"\s*:\s*"escape"/.test(s.lsdata)) score += 16;
+      if (/\bcancel\b/.test(s.combined)) score += 6;
+      if (/escape/.test(s.combined)) score += 6;
+      return score;
+    }) || dialog.querySelector("[role='button'][title*='Cancel' i]");
+  if ($cancel) {
+    log("Dismissing stale SAP dialog via Cancel/Escape");
+    clickSapButton($cancel);
+  } else {
+    log("Dismissing stale SAP dialog via Escape key");
+    pressEscapeOnElement(dialog);
+  }
+  try {
+    await waitFor(() => !isSecondaryWindowVisible(), { timeout: 4000 });
+  } catch (_) {
+    /* leave it; the caller will re-detect */
+  }
+  return true;
 }
 
 async function activateChangePasswordAndWaitForInput(anchorElement) {
@@ -901,6 +1013,13 @@ async function activateChangePasswordAndWaitForInput(anchorElement) {
 }
 
 async function ensureUserUnlockedIfNeeded() {
+  // A stale Lock/Unlock dialog from an earlier attempt would swallow the next
+  // action; clear it before doing anything else.
+  if (findOpenSapDialog()) {
+    log("Unlock step: clearing a leftover SAP dialog before starting");
+    await dismissOpenSapDialog();
+  }
+
   const $lockUnlock = findLockUnlockActionButton();
   if (!$lockUnlock) {
     log("Lock/Unlock button not found; continuing without unlock step");
@@ -909,21 +1028,25 @@ async function ensureUserUnlockedIfNeeded() {
 
   log("Unlock step: activating Lock/Unlock action");
   clickSapButton($lockUnlock);
-  await timeout();
 
-  const $status = await waitFor(() => findUnlockDialogStatusLabel(), {
-    timeout: 10000,
-  });
-  const statusText = String($status?.textContent || "").replace(/\s+/g, " ").trim();
+  // Wait for the dialog itself, then read its status line (which is a dynpro
+  // text field, not a button/label — see findUnlockDialogStatusLabel).
+  let statusText = "";
+  try {
+    const $status = await waitFor(() => findUnlockDialogStatusLabel(), {
+      timeout: 12000,
+    });
+    statusText = String($status?.textContent || "").replace(/\s+/g, " ").trim();
+  } catch (err) {
+    log("Unlock step: dialog status not found; dismissing and continuing", String(err?.message || err));
+    await dismissOpenSapDialog();
+    return;
+  }
   log("Unlock step: status detected", statusText);
 
   if (/\bnot\s+locked\b/i.test(statusText)) {
-    const $cancel = await waitFor(() => findUnlockDialogCancelButton(), {
-      timeout: 10000,
-    });
     log("Unlock step: user already unlocked, closing dialog via Cancel/Escape");
-    clickSapButton($cancel);
-    await waitForSecondaryWindowToClose();
+    await dismissOpenSapDialog();
     return;
   }
 
@@ -981,6 +1104,20 @@ function pressEnterOnElement(element) {
   triggerEvent(element, "keyup", options);
 }
 
+function pressEscapeOnElement(element) {
+  if (!element) return;
+  const options = {
+    bubbles: true,
+    cancelable: true,
+    key: "Escape",
+    code: "Escape",
+    keyCode: 27,
+    which: 27,
+  };
+  triggerEvent(element, "keydown", options);
+  triggerEvent(element, "keyup", options);
+}
+
 function pressShiftF8OnElement(element) {
   if (!element) return;
   const options = {
@@ -1002,26 +1139,84 @@ function isVisibleInput(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
-function findVisiblePasswordInputs() {
-  return Array.from(document.querySelectorAll("input[type='password']")).filter(
-    isVisibleInput
+/**
+ * A password field belonging to a Keycloak / SSO / generic web login form.
+ *
+ * The SAP page can carry a Keycloak-protected frame (the credential lookup the
+ * extension embeds). A document-wide `input[type=password]` scan then matches
+ * Keycloak's "Password" box instead of SAP's Change Password dialog, so the
+ * batch types the SAP password into the SSO form. These are never SAP controls.
+ */
+function isForeignLoginPasswordField(el) {
+  if (!el || el.nodeType !== 1) return false;
+  // Our own injected search panel holds no SAP controls.
+  if (el.closest("#batch-user-search-panel")) return true;
+  // Keycloak (PatternFly) and typical SSO login forms.
+  if (
+    el.closest(
+      "#kc-form, #kc-form-login, #kc-form-wrapper, .pf-c-login, .pf-v5-c-login, " +
+        "form[action*='login'], form[action*='/auth'], form[id*='kc-form']"
+    )
+  ) {
+    return true;
+  }
+  // A SAP dynpro field always carries a data-hint / lsdata path. A password box
+  // with none of that, keyed like a login form, is the SSO field.
+  const hint = String(
+    el.getAttribute("data-hint") || el.getAttribute("lsdata") || ""
+  );
+  if (hint) return false;
+  const autocomplete = String(el.getAttribute("autocomplete") || "").toLowerCase();
+  const name = String(el.getAttribute("name") || "").toLowerCase();
+  const id = String(el.id || "").toLowerCase();
+  if (autocomplete === "current-password") return true;
+  const loginNames = new Set(["password", "kc-password", "user_password", "pass"]);
+  return loginNames.has(name) || loginNames.has(id);
+}
+
+/**
+ * Scope for SAP Change Password fields: the open SAP dialog (modern ITS renders
+ * it as `div[role=dialog]`; legacy uses `data-hint="wnd[1]"`), else the page.
+ */
+function sapPasswordSearchRoot() {
+  const dialog = findOpenSapDialog();
+  if (dialog) return dialog;
+  const legacy = document.querySelector("[data-hint*='wnd[1]']");
+  if (legacy && typeof legacy.querySelectorAll === "function") return legacy;
+  return document.body;
+}
+
+function findVisiblePasswordInputs(root) {
+  const scope = root || sapPasswordSearchRoot();
+  if (!scope || typeof scope.querySelectorAll !== "function") return [];
+  return Array.from(scope.querySelectorAll("input[type='password']")).filter(
+    (el) => isVisibleInput(el) && !isForeignLoginPasswordField(el)
   );
 }
 
+/** Accept a located field only when it is not a Keycloak/SSO login box. */
+function acceptSapPasswordField(el) {
+  if (!el) return null;
+  return isForeignLoginPasswordField(el) ? null : el;
+}
+
 function findNewPasswordInput() {
+  const scope = sapPasswordSearchRoot();
   return (
-    findInputByLabel("New Password") ||
-    findInputByLabel("Password") ||
-    findVisiblePasswordInputs()[0] ||
+    acceptSapPasswordField(findInputByLabel(/new\s*password/i, scope)) ||
+    // A bare "Password" label is loose, so only trust it inside the SAP scope.
+    acceptSapPasswordField(findInputByLabel(/^\s*password\s*$/i, scope)) ||
+    findVisiblePasswordInputs(scope)[0] ||
     null
   );
 }
 
 function findRepeatPasswordInput() {
+  const scope = sapPasswordSearchRoot();
   return (
-    findInputByLabel("Repeat Password") ||
-    findInputByLabel("Retype Password") ||
-    findVisiblePasswordInputs()[1] ||
+    acceptSapPasswordField(findInputByLabel(/repeat\s*password/i, scope)) ||
+    acceptSapPasswordField(findInputByLabel(/retype\s*password/i, scope)) ||
+    findVisiblePasswordInputs(scope)[1] ||
     null
   );
 }
@@ -1061,6 +1256,205 @@ function doesPasswordStateContain(passwordStateText, containsValue) {
   return String(passwordStateText || "")
     .toLowerCase()
     .includes(filterValue.toLowerCase());
+}
+
+/** SU01: "Initial Password (Set by Administrator)", not "Production Password". */
+function passwordStatusIsInitial(text) {
+  return /\binitial\b/i.test(String(text || ""));
+}
+
+/**
+ * How many times to type a password when SAP's status bar does not confirm it.
+ * The screenshot message is "The password was changed"; some systems say
+ * "Password has been set". Either one counts. A miss is retried.
+ */
+const PASSWORD_SET_ATTEMPTS = 3;
+
+function passwordSetConfirmedByStatusBar(text) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  return /password\s+(?:was|has been)\s+(?:changed|set)\b/i.test(normalized);
+}
+
+/** Status bar when Repeat Password posted a different value than New Password. */
+function passwordFieldsMismatchedText(text) {
+  return /must be identical|not identical|do not match|are not identical|aren't identical/i.test(
+    String(text || "")
+  );
+}
+
+/**
+ * A confirmation counts only when it showed up after Apply.
+ * The bar often still says "The password was changed" from the previous user,
+ * so an unchanged fingerprint is not a new success.
+ */
+function freshPasswordSetStatus(text, fingerprint, baselineFingerprint, statusTouched) {
+  if (!passwordSetConfirmedByStatusBar(text)) return "";
+  if (statusTouched || fingerprint !== baselineFingerprint) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+
+function sapStatusBarElements() {
+  const selectors = [
+    ".lsMessageBar",
+    ".lsMessageBar__text",
+    ".urMsgBar",
+    "[ct='MB']",
+    "[id*='sbar']",
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const sel of selectors) {
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(sel));
+    } catch (_) {
+      nodes = [];
+    }
+    for (const el of nodes) {
+      if (!el || seen.has(el)) continue;
+      if (typeof el.closest === "function" && el.closest("#batch-user-search-panel")) continue;
+      seen.add(el);
+      out.push(el);
+    }
+  }
+  return out;
+}
+
+function readSapStatusBarText() {
+  const chunks = [];
+  for (const el of sapStatusBarElements()) {
+    const text = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const title = String(el.getAttribute?.("title") || "").replace(/\s+/g, " ").trim();
+    if (text) chunks.push(text);
+    if (title && title !== text) chunks.push(title);
+  }
+  const unique = [];
+  for (const chunk of chunks) {
+    if (unique.includes(chunk)) continue;
+    // A parent status bar repeats its child's message. Keep the shorter line.
+    if (unique.some((have) => have.includes(chunk) && have.length > chunk.length)) continue;
+    for (let i = unique.length - 1; i >= 0; i -= 1) {
+      if (chunk.includes(unique[i]) && chunk.length > unique[i].length) unique.splice(i, 1);
+    }
+    unique.push(chunk);
+  }
+  return unique.join(" ");
+}
+
+function statusBarFingerprint() {
+  return sapStatusBarElements()
+    .map((el) =>
+      [
+        el.getAttribute?.("lsdata") || "",
+        el.getAttribute?.("title") || "",
+        typeof el.className === "string" ? el.className : "",
+        String(el.textContent || "").replace(/\s+/g, " ").trim(),
+      ].join("|")
+    )
+    .join("||");
+}
+
+function isStatusBarNode(node) {
+  if (!node || node.nodeType !== 1 || typeof node.getAttribute !== "function") return false;
+  const id = String(node.id || "");
+  const ct = String(node.getAttribute("ct") || "");
+  const cls = typeof node.className === "string" ? node.className : "";
+  return /sbar/i.test(id) || ct === "MB" || /lsMessageBar|urMsgBar|messagebar/i.test(cls);
+}
+
+function mutationTouchesStatusBar(record) {
+  const nodes = [record?.target];
+  if (record?.addedNodes) nodes.push(...record.addedNodes);
+  if (record?.removedNodes) nodes.push(...record.removedNodes);
+  for (const node of nodes) {
+    const el = node && node.nodeType === 1 ? node : node?.parentElement;
+    if (!el || typeof el.getAttribute !== "function") continue;
+    if (isStatusBarNode(el)) return true;
+    if (typeof el.closest === "function" && el.closest(".lsMessageBar, .lsMessageBar__text, .urMsgBar, [ct='MB']")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function beginStatusBarWatch() {
+  const baselineFingerprint = statusBarFingerprint();
+  let statusTouched = false;
+  let observer = null;
+  if (typeof MutationObserver === "function" && document.documentElement) {
+    observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (mutationTouchesStatusBar(record)) {
+          statusTouched = true;
+          break;
+        }
+      }
+    });
+    try {
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+      });
+    } catch (_) {
+      observer = null;
+    }
+  }
+  return {
+    stop() {
+      try {
+        observer?.disconnect();
+      } catch (_) {}
+    },
+    confirmed() {
+      return freshPasswordSetStatus(
+        readSapStatusBarText(),
+        statusBarFingerprint(),
+        baselineFingerprint,
+        statusTouched
+      );
+    },
+    mismatch() {
+      const text = readSapStatusBarText();
+      return passwordFieldsMismatchedText(text) ? text : "";
+    },
+  };
+}
+
+async function pollPasswordSetConfirmation(watch, timeoutMs = 12000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    throwIfBatchCancelled();
+    const mismatch = watch.mismatch();
+    if (mismatch) return { confirmed: "", mismatch };
+    const text = watch.confirmed();
+    if (text && !isSecondaryWindowVisible()) return { confirmed: text, mismatch: "" };
+    await timeout(200);
+  }
+  const lateMismatch = watch.mismatch();
+  if (lateMismatch) return { confirmed: "", mismatch: lateMismatch };
+  const late = watch.confirmed();
+  return {
+    confirmed: late && !isSecondaryWindowVisible() ? late : "",
+    mismatch: "",
+  };
+}
+
+/** Pause 0.45s–1.6s so each account is checked like a person, not a tight loop. */
+async function humanPause() {
+  const ms = 450 + Math.floor(Math.random() * 1150);
+  log("Human pause", ms);
+  const step = 150;
+  let left = ms;
+  while (left > 0) {
+    throwIfBatchCancelled();
+    const slice = Math.min(step, left);
+    await timeout(slice);
+    left -= slice;
+  }
 }
 
 function findPasswordDialogCancelButton() {
@@ -1105,7 +1499,20 @@ const CLI_MESSAGE_SOURCE = "sap-batch-cli";
 const CLI_RESULT_SOURCE = "sap-batch-cli-result";
 const CLI_LISTENER_FLAG = "__batchUserAccountsCliListenerRegistered";
 
+function finishBatch(results) {
+  const rows = Array.isArray(results) ? results : [];
+  const cancelled = Boolean(
+    batchCancelRequested || rows.some((row) => row && row.cancelled)
+  );
+  return { success: true, cancelled, results: rows };
+}
+
 function runBatchAction(message) {
+  if (message?.type === "CANCEL_BATCH") {
+    batchCancelRequested = true;
+    log("Batch cancel requested");
+    return Promise.resolve({ success: true, cancelled: true });
+  }
   if (message.type === "ENSURE_USERS_MAINTENANCE") {
     if (isBatchRunning) {
       return Promise.resolve({
@@ -1137,7 +1544,7 @@ function runBatchAction(message) {
     isBatchRunning = true;
     log("Calling modifySAPUsers with data:", message.data);
     return modifySAPUsers(message.data)
-      .then((results) => ({ success: true, results }))
+      .then((results) => finishBatch(results))
       .catch((err) => ({ success: false, error: String(err?.message || err) }))
       .finally(() => {
         isBatchRunning = false;
@@ -1156,7 +1563,7 @@ function runBatchAction(message) {
       overwrite: Boolean(message.overwrite),
       passwordStateContains: message.passwordStateContains,
     })
-      .then((results) => ({ success: true, results }))
+      .then((results) => finishBatch(results))
       .catch((err) => ({ success: false, error: String(err?.message || err) }))
       .finally(() => {
         isBatchRunning = false;
@@ -1492,12 +1899,18 @@ async function ensureUsersMaintenancePage() {
 
 // Main batch edit logic
 async function modifySAPUsers(tableData) {
-  await ensureUsersMaintenancePage();
+  batchCancelRequested = false;
+  try {
+    await ensureUsersMaintenancePage();
+  } catch (err) {
+    if (err?.code === "cancelled") return [];
+    throw err;
+  }
   const results = [];
   let num = 0;
   for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
     try {
-      await timeout();
+      await humanPause();
       log("Modding User: ", ++num, student);
       const $user = await waitForEditableUserInput();
       await setInputValueRobust($user, student.sapLogin);
@@ -1545,6 +1958,16 @@ async function modifySAPUsers(tableData) {
       triggerEvent($save, "click");
       results.push({ sapLogin: student.sapLogin, success: true });
     } catch (err) {
+      if (err?.code === "cancelled") {
+        log("Modify cancelled", student.sapLogin);
+        results.push({
+          sapLogin: student.sapLogin,
+          success: false,
+          cancelled: true,
+          error: "Cancelled",
+        });
+        break;
+      }
       const error = String(err?.message || err);
       log("Modify failed for", student.sapLogin, error);
       results.push({ sapLogin: student.sapLogin, success: false, error });
@@ -1553,9 +1976,170 @@ async function modifySAPUsers(tableData) {
   log("Batch user login update complete!");
   return results;
 }
+/**
+ * WebGUI commits the focused password field only when it really blurs.
+ * Repeat Password is still focused when Apply is clicked, so the server
+ * receives New Password and an empty Repeat, then says they must be identical.
+ * No key is sent. Moving to the next control or submitting from the keyboard
+ * adds a character to Repeat's buffer.
+ */
+async function commitFocusedPasswordField() {
+  const active = document.activeElement;
+  const tag = active && active.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") {
+    log("Password: blurring the focused field so WebGUI posts it");
+    active.blur();
+  }
+  let left = 500;
+  while (left > 0) {
+    throwIfBatchCancelled();
+    const slice = Math.min(100, left);
+    await timeout(slice);
+    left -= slice;
+  }
+}
+
+/**
+ * One attempt to set a student's password.
+ * `done: true` means do not retry (confirmed, or a Production password we must
+ * leave alone). `done: false` means the status bar never confirmed the change.
+ */
+async function setStudentPasswordOnce(student, passwordStateContains) {
+  throwIfBatchCancelled();
+  log("Password set attempt for", student.sapLogin);
+  const $user = await waitForEditableUserInput();
+  await setInputValueRobust($user, student.sapLogin);
+  await ensureUserUnlockedIfNeeded();
+  throwIfBatchCancelled();
+  await setInputValueRobust($user, student.sapLogin);
+  const $newPass = await activateChangePasswordAndWaitForInput($user);
+  await humanPause();
+  const passwordStateText = await getPasswordStateText(8000);
+  if (!doesPasswordStateContain(passwordStateText, passwordStateContains)) {
+    log(
+      "Password already set; skipping (Override production password is off)",
+      student.sapLogin,
+      "state:",
+      passwordStateText
+    );
+    await closePasswordDialogViaX();
+    return {
+      done: true,
+      result: {
+        sapLogin: student.sapLogin,
+        success: false,
+        skipped: true,
+        validated: false,
+        passwordState: passwordStateText,
+        error: `Password already set (\"${passwordStateText}\"); tick Override production password to replace it`,
+      },
+    };
+  }
+  await humanPause();
+  log("Password 2/4: waiting for New Password input");
+  const newFilled = await setSapPasswordField($newPass, student.sapPassword, {
+    resolve: () => findNewPasswordInput(),
+  });
+  if (!newFilled) {
+    log("New password field did not receive the full password", student.sapLogin);
+    return {
+      done: false,
+      error: "New password field did not receive the full password",
+    };
+  }
+  log("Password 3/4: waiting for Repeat Password input");
+  const $confirmPass = await waitFor(() => findRepeatPasswordInput(), {
+    timeout: 20000,
+  });
+  const repeatFilled = await setSapPasswordField($confirmPass, student.sapPassword, {
+    resolve: () => findRepeatPasswordInput(),
+  });
+  if (!repeatFilled) {
+    log("Repeat password field did not receive the full password", student.sapLogin);
+    return {
+      done: false,
+      error: "Repeat password field did not receive the full password",
+    };
+  }
+  await humanPause();
+  log("Password 4/4: clicking the check without Enter");
+  // WebGUI posts a password field when focus actually leaves it. New Password
+  // blurs as Repeat is focused, so that value is posted. Repeat stays focused,
+  // Apply submits it empty, and the status bar says the passwords must be
+  // identical while both boxes still show the same bullets. Blur Repeat with
+  // no Tab and no Enter, then click the green check.
+  const confirmPassword = async () => {
+    await commitFocusedPasswordField();
+    const $save = await waitFor(() => findPasswordDialogConfirmButton(), {
+      timeout: 20000,
+    });
+    log("Password check/confirm action found", $save);
+    const watch = beginStatusBarWatch();
+    try {
+      clickSapButton($save);
+      return await pollPasswordSetConfirmation(watch, 12000);
+    } finally {
+      watch.stop();
+    }
+  };
+  let polled = await confirmPassword();
+  if (polled.mismatch) {
+    log(
+      "Repeat password did not match; clearing both fields and trying once more",
+      student.sapLogin
+    );
+    const $newAgain = await waitFor(() => findNewPasswordInput(), { timeout: 20000 });
+    const newAgain = await setSapPasswordField($newAgain, student.sapPassword, {
+      resolve: () => findNewPasswordInput(),
+    });
+    const $repeatAgain = await waitFor(() => findRepeatPasswordInput(), { timeout: 20000 });
+    const repeatAgain = await setSapPasswordField($repeatAgain, student.sapPassword, {
+      resolve: () => findRepeatPasswordInput(),
+    });
+    if (newAgain && repeatAgain) polled = await confirmPassword();
+  }
+  if (polled.mismatch) {
+    log("Repeat password still did not match; closing the dialog", student.sapLogin);
+    await closePasswordDialogViaX().catch(() => dismissOpenSapDialog());
+    return {
+      done: true,
+      result: {
+        sapLogin: student.sapLogin,
+        success: false,
+        validated: false,
+        statusBarConfirmed: false,
+        error: "The passwords specified must be identical",
+      },
+    };
+  }
+  if (!polled.confirmed) {
+    log("Password status bar did not confirm", student.sapLogin, readSapStatusBarText());
+    return {
+      done: false,
+      error: "Password status bar did not confirm the change",
+    };
+  }
+  const statusText = polled.confirmed;
+  log("Password status bar confirmed", student.sapLogin, statusText);
+  if (isSecondaryWindowVisible()) {
+    await closePasswordDialogViaX().catch(() => dismissOpenSapDialog());
+  }
+  return {
+    done: true,
+    result: {
+      sapLogin: student.sapLogin,
+      success: true,
+      validated: true,
+      statusBarConfirmed: true,
+      statusBar: statusText,
+      passwordState: statusText,
+    },
+  };
+}
+
 // Main batch initialize / change passwords logic
 async function changeSAPPasswords(tableData, options = {}) {
-  await ensureUsersMaintenancePage();
+  batchCancelRequested = false;
   const overwrite = Boolean(options?.overwrite);
   // Without overwrite: only accounts whose password has not been set by the
   // student yet (SAP status contains "Initial").
@@ -1564,56 +2148,65 @@ async function changeSAPPasswords(tableData, options = {}) {
     : String(options?.passwordStateContains || "Initial").trim() || "Initial";
   const results = [];
   let num = 0;
-  for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
-    try {
-      await timeout();
-      log("Initializing password for user:", ++num, student, { overwrite, passwordStateContains });
-      const $user = await waitForEditableUserInput();
-      await setInputValueRobust($user, student.sapLogin);
-      await ensureUserUnlockedIfNeeded();
-      await setInputValueRobust($user, student.sapLogin);
-      const $newPass = await activateChangePasswordAndWaitForInput($user);
-      const passwordStateText = await getPasswordStateText(8000);
-      if (!doesPasswordStateContain(passwordStateText, passwordStateContains)) {
-        log(
-          "Password already set; skipping (Overwrite is off)",
-          student.sapLogin,
-          "state:",
-          passwordStateText
-        );
-        await closePasswordDialogViaX();
+  try {
+    await ensureUsersMaintenancePage();
+    for (const student of /** @type {LoginSAPFields[]} */ (tableData)) {
+      throwIfBatchCancelled();
+      let settled = null;
+      let lastError = "Password status bar did not confirm the change";
+      for (let attempt = 1; attempt <= PASSWORD_SET_ATTEMPTS && !settled; attempt += 1) {
+        try {
+          throwIfBatchCancelled();
+          if (attempt > 1) {
+            log(
+              "Password set was not confirmed; retrying",
+              student.sapLogin,
+              "attempt",
+              attempt
+            );
+            await dismissOpenSapDialog();
+            await humanPause();
+          } else {
+            await humanPause();
+            log("Initializing password for user:", ++num, student, {
+              overwrite,
+              passwordStateContains,
+            });
+          }
+          const outcome = await setStudentPasswordOnce(student, passwordStateContains);
+          if (outcome.done) {
+            settled = outcome.result;
+          } else {
+            lastError = outcome.error || lastError;
+          }
+        } catch (err) {
+          if (err?.code === "cancelled") throw err;
+          lastError = String(err?.message || err);
+          log("Password initialize failed for", student.sapLogin, lastError);
+          await dismissOpenSapDialog().catch(() => {});
+        }
+      }
+      if (settled) {
+        if (settled.success) log("Initialized password for", student.sapLogin);
+        results.push(settled);
+      } else {
+        log("Password was not confirmed after retries", student.sapLogin, lastError);
         results.push({
           sapLogin: student.sapLogin,
           success: false,
-          skipped: true,
-          error: `Password already set (\"${passwordStateText}\"); enable Overwrite to replace it`,
+          validated: false,
+          statusBarConfirmed: false,
+          error: lastError,
         });
-        continue;
       }
-      log("Password 2/4: waiting for New Password input");
-      await setInputValueRobust($newPass, student.sapPassword);
-      log("Password 3/4: waiting for Repeat Password input");
-      const $confirmPass = await waitFor(() => findRepeatPasswordInput(), {
-        timeout: 20000,
-      }
-      );
-      await setInputValueRobust($confirmPass, student.sapPassword);
-      await timeout();
-      log("Password 4/4: waiting for check/confirm action");
-      const $save = await waitFor(() => findPasswordDialogConfirmButton(), {
-        timeout: 20000,
-      });
-      log("Password check/confirm action found", $save);
-      clickSapButton($save);
-      // Some SAP dialogs react only to Enter on focused input/toolbar button.
-      pressEnterOnElement($confirmPass);
-      log("Initialized password for", student.sapLogin);
-      results.push({ sapLogin: student.sapLogin, success: true });
-    } catch (err) {
-      const error = String(err?.message || err);
-      log("Password initialize failed for", student.sapLogin, error);
-      results.push({ sapLogin: student.sapLogin, success: false, error });
     }
+  } catch (err) {
+    if (err?.code === "cancelled") {
+      log("Batch cancelled");
+      await dismissOpenSapDialog().catch(() => {});
+      return results;
+    }
+    throw err;
   }
   log("Batch initialize SAP passwords complete!");
   return results;

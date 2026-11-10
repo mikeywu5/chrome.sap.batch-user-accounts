@@ -1,4 +1,27 @@
 /**
+ * Robustly blur an element, simulating tab away and dispatching all relevant events.
+ * Useful for SAP/enterprise apps that require synthetic blur events.
+ * @param {HTMLElement} el - The element to blur
+ */
+export function blurElement(el) {
+  if (!el) return;
+  el.blur();
+  // Dispatch synthetic blur events
+  el.dispatchEvent(new Event("blur", { bubbles: false }));
+  el.dispatchEvent(new Event("focusout", { bubbles: true }));
+  // Simulate tab keydown (optional, for listeners)
+  el.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      key: "Tab",
+      code: "Tab",
+      keyCode: 9,
+      which: 9,
+      bubbles: true,
+      cancelable: true,
+    })
+  );
+}
+/**
  * Simulate keyboard typing into an input/textarea element by setting its value character by character.
  * Dispatches input and change events to mimic real typing.
  * @param {HTMLInputElement|HTMLTextAreaElement} el - The input or textarea element
@@ -75,9 +98,10 @@ export async function typeValue(el, value, delay = 30) {
  */
 export async function setInputValueRobust(el, value, opts = {}) {
   if (!el) return;
-  const delay = Number.isFinite(opts.delay) ? opts.delay : 15;
+  const delay = Number.isFinite(opts.delay) ? opts.delay : 50;
   el.focus();
   const old = el.value;
+
   try {
     // Strategy 1: Native value setter on prototype
     const proto = Object.getPrototypeOf(el);
@@ -86,7 +110,7 @@ export async function setInputValueRobust(el, value, opts = {}) {
       desc.set.call(el, value);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (el.value === value) return true;
+      //if (el.value === value) return true;
     }
   } catch (_) {}
   try {
@@ -94,25 +118,136 @@ export async function setInputValueRobust(el, value, opts = {}) {
     el.setAttribute("value", value);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (el.value === value) return true;
+    //if (el.value === value) return true;
   } catch (_) {}
   try {
     // Strategy 3: beforeinput + composition to trigger SAP listeners
     el.value = "";
-    el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertReplacementText", data: value }));
+    el.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertReplacementText",
+        data: value,
+      })
+    );
     el.dispatchEvent(new CompositionEvent("compositionstart", { data: "" }));
     for (const ch of value) {
       el.dispatchEvent(new CompositionEvent("compositionupdate", { data: ch }));
     }
     el.value = value;
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    el.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: value,
+      })
+    );
     el.dispatchEvent(new CompositionEvent("compositionend", { data: value }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (el.value === value) return true;
+    //if (el.value === value) return true;
   } catch (_) {}
   // Strategy 4: fallback to simulated typing
   await typeValue(el, value, delay);
   return el.value === value;
+}
+
+/**
+ * Type a SAP Change Password field one character at a time.
+ *
+ * SU01's password boxes drop characters when the whole value is assigned at
+ * once: a roundtrip comes back while typing is still going and the field is
+ * left with the last two or four keystrokes. Bulk input/change events are
+ * what start that roundtrip, so this waits for focus to settle, types a
+ * single character, and checks the length before the next one.
+ *
+ * @param {HTMLInputElement} el
+ * @param {string} value
+ * @param {{delay?: number, attempts?: number}} [opts]
+ * @returns {Promise<boolean>} true when the field holds every character
+ */
+export async function setSapPasswordField(el, value, opts = {}) {
+  if (!el) return false;
+  const text = String(value ?? "");
+  if (!text) return false;
+  const delay = Number.isFinite(opts.delay) ? opts.delay : 90;
+  const attempts = Number.isFinite(opts.attempts) ? opts.attempts : 4;
+
+  const write = (node, next) => {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(node), "value");
+      if (desc && typeof desc.set === "function") {
+        desc.set.call(node, next);
+        return;
+      }
+    } catch (_) {}
+    node.value = next;
+  };
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (!el.isConnected && opts.resolve) {
+      const fresh = opts.resolve();
+      if (fresh) el = fresh;
+    }
+    try {
+      el.focus();
+    } catch (_) {}
+    // Focus itself clears the box a moment later. Typing before that
+    // leaves only the keystrokes that landed after the clear.
+    await timeout(200);
+    if (typeof el.maxLength === "number" && el.maxLength > 0 && el.maxLength < text.length) {
+      try {
+        el.maxLength = text.length;
+      } catch (_) {}
+    }
+    write(el, "");
+    await timeout(80);
+
+    let built = "";
+    let readable = false;
+    let interrupted = false;
+    for (const char of text) {
+      built += char;
+      const keyInit = {
+        key: char,
+        bubbles: true,
+        cancelable: true,
+      };
+      el.dispatchEvent(new KeyboardEvent("keydown", keyInit));
+      write(el, built);
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          cancelable: true,
+          data: char,
+          inputType: "insertText",
+        })
+      );
+      el.dispatchEvent(new KeyboardEvent("keyup", keyInit));
+      await timeout(delay);
+      const have = String(el.value || "");
+      if (have.length > 0) readable = true;
+      if (readable && have.length < built.length) {
+        interrupted = true;
+        break;
+      }
+    }
+    if (interrupted) continue;
+
+    const stable = await passwordValueHeld(el, text.length, 350);
+    if (!readable) return true;
+    if (stable) return true;
+  }
+  return String(el.value || "").length === text.length;
+}
+
+async function passwordValueHeld(el, length, ms) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (String(el?.value || "").length !== length) return false;
+    await timeout(40);
+  }
+  return String(el?.value || "").length === length;
 }
 /**
  * Dispatch an event of the given type on the root element and all its descendants.
@@ -134,6 +269,31 @@ export function triggerEvent(root, eventType, eventInit = {}) {
     }
   }
 }
+
+/**
+ * Robustly focus an element, simulating tab navigation and dispatching all relevant events.
+ * Useful for SAP/enterprise apps that require synthetic focus events.
+ * @param {HTMLElement} el - The element to focus
+ */
+export function focusElement(el) {
+  if (!el) return;
+  el.focus();
+  // Dispatch synthetic focus events
+  el.dispatchEvent(new Event("focus", { bubbles: false }));
+  el.dispatchEvent(new Event("focusin", { bubbles: true }));
+  // Simulate tab keydown (optional, for listeners)
+  el.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      key: "Tab",
+      code: "Tab",
+      keyCode: 9,
+      which: 9,
+      bubbles: true,
+      cancelable: true,
+    })
+  );
+}
+
 /**
  * Await a timeout for a given number of milliseconds.
  * @param {number} ms - Milliseconds to wait
@@ -445,8 +605,13 @@ export async function waitFor(callback, options = {}) {
           clear();
           resolve(val);
         }
-      } catch (_) {
-        // Ignore errors and keep polling
+      } catch (err) {
+        // A batch cancel must stop the wait. Other probe errors stay ignored
+        // so a missing control can keep being polled until timeout.
+        if (err?.code === "cancelled" || err?.name === "AbortError") {
+          clear();
+          reject(err);
+        }
       }
     };
 
