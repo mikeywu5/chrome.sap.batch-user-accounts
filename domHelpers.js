@@ -235,10 +235,128 @@ export async function setSapPasswordField(el, value, opts = {}) {
     if (interrupted) continue;
 
     const stable = await passwordValueHeld(el, text.length, 350);
-    if (!readable) return true;
-    if (stable) return true;
+    if (!readable || stable) {
+      const committed = await commitSapInputField(el);
+      if (committed) return true;
+    }
+    // The characters are in the HTML input. WebGUI still treats the field as
+    // empty until that pending value is activated on the InputField control.
+    const committed = await commitSapInputField(el);
+    if (committed) return true;
   }
-  return String(el.value || "").length === text.length;
+  return false;
+}
+
+/**
+ * Page-world bridge. The content script cannot see UCF_System, so this runs
+ * in the page and writes its result onto the field for the content script to
+ * read. "unchanged" counts only when the control already holds the same
+ * non-empty value the box is showing.
+ */
+export const SAP_FIELD_COMMIT_SOURCE = `(function(){
+  if (window.__sapBatchCommitField) return;
+  function idle() {
+    var ls = window.UCF_System && window.UCF_System.oLS;
+    if (!ls) return true;
+    var win = ls.oBrowserWindow;
+    var locked = win && typeof win.bIsLocked === "function" && win.bIsLocked();
+    return !ls.oPendingRequest && !locked;
+  }
+  window.__sapBatchCommitField = function(id, requestId) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    function finish(status) {
+      var start = Date.now();
+      (function waitIdle() {
+        if (idle() || Date.now() - start > 4000) {
+          el.setAttribute("data-sap-commit-result", requestId + ":" + status);
+          return;
+        }
+        setTimeout(waitIdle, 50);
+      })();
+    }
+    var ls = window.UCF_System && window.UCF_System.oLS;
+    if (!ls || typeof ls.oGetControlByDomRef !== "function") {
+      finish("missing-framework");
+      return;
+    }
+    var control = ls.oGetControlByDomRef(el);
+    if (!control || typeof control.prepareFireChange !== "function") {
+      finish("missing-control");
+      return;
+    }
+    var current = "";
+    try {
+      current = typeof control.sGetCurrentValue === "function"
+        ? String(control.sGetCurrentValue() || "")
+        : String(el.value || "");
+    } catch (e) {
+      current = String(el.value || "");
+    }
+    if (!current) {
+      finish("empty");
+      return;
+    }
+    try {
+      control.prepareFireChange();
+      finish("ok");
+    } catch (e) {
+      var msg = String(e && e.message || e);
+      var stored = String(control.sValue || "");
+      if (/unchanged/i.test(msg) && stored === current) finish("unchanged");
+      else finish("error");
+    }
+  };
+})();`;
+
+const SAP_COMMIT_OK = new Set(["ok", "unchanged"]);
+
+function installSapFieldCommit() {
+  if (typeof document === "undefined") return false;
+  const root = document.documentElement;
+  if (!root) return false;
+  if (root.getAttribute("data-sap-batch-commit") === "ready") return true;
+  const script = document.createElement("script");
+  script.textContent = SAP_FIELD_COMMIT_SOURCE;
+  root.appendChild(script);
+  script.remove();
+  root.setAttribute("data-sap-batch-commit", "ready");
+  return true;
+}
+
+/**
+ * Activate a typed password on SAP's InputField after the keystrokes have
+ * settled. Resolves true when the control holds that value and the page is
+ * idle, so the next Apply posts it.
+ * A field with no id (unit tests, non-WebGUI inputs) has nothing to activate.
+ * @param {Element} el
+ * @returns {Promise<boolean>}
+ */
+export function commitSapInputField(el) {
+  if (!el || !el.id || typeof document === "undefined") return Promise.resolve(true);
+  if (!installSapFieldCommit()) return Promise.resolve(false);
+  const requestId = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const script = document.createElement("script");
+  script.textContent = `window.__sapBatchCommitField(${JSON.stringify(el.id)},${JSON.stringify(requestId)})`;
+  (document.head || document.documentElement).appendChild(script);
+  script.remove();
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      const result = el.getAttribute("data-sap-commit-result") || "";
+      const prefix = `${requestId}:`;
+      if (result.startsWith(prefix)) {
+        clearInterval(timer);
+        el.removeAttribute("data-sap-commit-result");
+        resolve(SAP_COMMIT_OK.has(result.slice(prefix.length)));
+        return;
+      }
+      if (Date.now() - start > 6000) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 40);
+  });
 }
 
 async function passwordValueHeld(el, length, ms) {
