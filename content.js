@@ -8,6 +8,7 @@ const {
   typeValue,
   setInputValueRobust,
   setSapPasswordField,
+  commitSapInputField,
   timeout,
 } = require("./domHelpers");
 
@@ -1977,26 +1978,41 @@ async function modifySAPUsers(tableData) {
   return results;
 }
 /**
- * WebGUI commits the focused password field only when it really blurs.
- * Repeat Password is still focused when Apply is clicked, so the server
- * receives New Password and an empty Repeat, then says they must be identical.
- * No key is sent. Moving to the next control or submitting from the keyboard
- * adds a character to Repeat's buffer.
+ * Typing leaves the password in the HTML input. SAP's InputField does not
+ * take that value until its Change runs, so Apply otherwise posts an empty
+ * field and the status bar says "Enter an initial password".
+ * Activate both fields after the typed value has settled, wait until that
+ * action is idle, then Apply. Do not send Enter: that adds a character.
+ * @returns {Promise<boolean>}
  */
 async function commitFocusedPasswordField() {
-  const active = document.activeElement;
-  const tag = active && active.tagName;
-  if (tag === "INPUT" || tag === "TEXTAREA") {
-    log("Password: blurring the focused field so WebGUI posts it");
-    active.blur();
+  const fields = [];
+  const seen = new Set();
+  for (const field of [findNewPasswordInput(), findRepeatPasswordInput(), document.activeElement]) {
+    if (!field || field.nodeType !== 1 || seen.has(field)) continue;
+    const tag = field.tagName;
+    if (tag !== "INPUT" && tag !== "TEXTAREA") continue;
+    seen.add(field);
+    fields.push(field);
   }
-  let left = 500;
+  log("Password: committing the typed password so WebGUI posts it");
+  let ok = fields.length > 0;
+  for (const field of fields) {
+    throwIfBatchCancelled();
+    const committed = await commitSapInputField(field);
+    if (!committed) ok = false;
+    try {
+      field.blur();
+    } catch (_) {}
+  }
+  let left = 200;
   while (left > 0) {
     throwIfBatchCancelled();
     const slice = Math.min(100, left);
     await timeout(slice);
     left -= slice;
   }
+  return ok;
 }
 
 /**
@@ -2063,13 +2079,15 @@ async function setStudentPasswordOnce(student, passwordStateContains) {
   }
   await humanPause();
   log("Password 4/4: clicking the check without Enter");
-  // WebGUI posts a password field when focus actually leaves it. New Password
-  // blurs as Repeat is focused, so that value is posted. Repeat stays focused,
-  // Apply submits it empty, and the status bar says the passwords must be
-  // identical while both boxes still show the same bullets. Blur Repeat with
-  // no Tab and no Enter, then click the green check.
+  // Both boxes can show bullets while SAP's controls are still empty. Commit
+  // each InputField after typing settles, wait until that action is idle, then
+  // click the green check. No Tab and no Enter.
   const confirmPassword = async () => {
-    await commitFocusedPasswordField();
+    const committed = await commitFocusedPasswordField();
+    if (!committed) {
+      log("Password fields were typed but SAP did not commit them", student.sapLogin);
+      return { confirmed: "", mismatch: false };
+    }
     const $save = await waitFor(() => findPasswordDialogConfirmButton(), {
       timeout: 20000,
     });
@@ -2113,10 +2131,13 @@ async function setStudentPasswordOnce(student, passwordStateContains) {
     };
   }
   if (!polled.confirmed) {
-    log("Password status bar did not confirm", student.sapLogin, readSapStatusBarText());
+    const bar = readSapStatusBarText();
+    log("Password status bar did not confirm", student.sapLogin, bar);
     return {
       done: false,
-      error: "Password status bar did not confirm the change",
+      error: bar
+        ? `Password status bar did not confirm the change: ${bar}`
+        : "Password status bar did not confirm the change",
     };
   }
   const statusText = polled.confirmed;
@@ -2191,6 +2212,7 @@ async function changeSAPPasswords(tableData, options = {}) {
         results.push(settled);
       } else {
         log("Password was not confirmed after retries", student.sapLogin, lastError);
+        await dismissOpenSapDialog().catch(() => {});
         results.push({
           sapLogin: student.sapLogin,
           success: false,

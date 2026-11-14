@@ -70,9 +70,11 @@ test("a reset is not success until the status bar confirms, and a miss is retrie
   const clickAt = once.indexOf("clickSapButton", confirmAt);
   assert.ok(blurAt > confirmAt && blurAt < clickAt, "Repeat must blur before Apply");
   const commit = extractFunction("commitFocusedPasswordField");
-  assert.match(commit, /blurring the focused field so WebGUI posts it/);
+  assert.match(commit, /committing the typed password so WebGUI posts it/);
+  assert.match(commit, /commitSapInputField/);
   assert.match(commit, /\.blur\(\)/);
-  assert.doesNotMatch(commit, /Tab|pressEnterOnElement|key:\s*"Enter"/);
+  assert.match(once, /SAP did not commit them/);
+  assert.doesNotMatch(commit, /pressEnterOnElement|key:\s*"Enter"/);
   assert.match(fn, /humanPause\(\)/);
   const successAt = once.indexOf("statusBarConfirmed: true");
   assert.ok(

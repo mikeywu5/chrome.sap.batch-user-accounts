@@ -241,6 +241,51 @@ export async function setSapPasswordField(el, value, opts = {}) {
   return String(el.value || "").length === text.length;
 }
 
+const SAP_COMMIT_OK = new Set(["ok", "unchanged"]);
+
+/**
+ * Ask the page-world commit script to activate a typed password.
+ * The isolated content script cannot see UCF_System, and a script tag it
+ * inserts does not run on this WebGUI. sap-field-commit.js runs in the page
+ * and writes data-sap-commit-result when the InputField holds the value and
+ * SAP is idle.
+ * A field with no id (unit tests, non-WebGUI inputs) has nothing to activate.
+ * @param {Element} el
+ * @returns {Promise<boolean>}
+ */
+export function commitSapInputField(el) {
+  if (!el || !el.id || typeof document === "undefined") return Promise.resolve(true);
+  const requestId = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const arm = (node) => {
+    if (!node || typeof node.setAttribute !== "function") return;
+    node.removeAttribute("data-sap-commit-result");
+    node.setAttribute("data-sap-commit-request", requestId);
+  };
+  arm(el);
+  try {
+    document.dispatchEvent(new Event("sap-batch-commit-field"));
+  } catch (_) {}
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      const node =
+        (typeof document.getElementById === "function" && document.getElementById(el.id)) || el;
+      const result = (node && node.getAttribute && node.getAttribute("data-sap-commit-result")) || "";
+      const prefix = `${requestId}:`;
+      if (result.startsWith(prefix)) {
+        clearInterval(timer);
+        node.removeAttribute("data-sap-commit-result");
+        resolve(SAP_COMMIT_OK.has(result.slice(prefix.length)));
+        return;
+      }
+      if (Date.now() - start > 6000) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 40);
+  });
+}
+
 async function passwordValueHeld(el, length, ms) {
   const start = Date.now();
   while (Date.now() - start < ms) {

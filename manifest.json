@@ -30,7 +30,18 @@
     {
       "matches": [
         "https://*/sap/bc/gui/sap/its/webgui/?sap-client=*&language=*",
-        "https://*/sap/bc/gui/sap/its/webgui/?sap-client=*"
+        "https://*/sap/bc/gui/sap/its/webgui/?sap-client=*",
+        "https://*/sap/bc/gui/sap/its/webgui*"
+      ],
+      "js": ["sap-field-commit.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://*/sap/bc/gui/sap/its/webgui/?sap-client=*&language=*",
+        "https://*/sap/bc/gui/sap/its/webgui/?sap-client=*",
+        "https://*/sap/bc/gui/sap/its/webgui*"
       ],
       "js": ["content.bundle.js"]
     }
